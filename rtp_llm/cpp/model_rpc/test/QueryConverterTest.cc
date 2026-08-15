@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -166,6 +167,7 @@ TEST_F(QueryConverterTest, RoleAddrPreservesPdfusionDefaultAndRejectsConflicts) 
 }
 
 TEST_F(QueryConverterTest, testTransOutput) {
+    constexpr int64_t long_duration_us = static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 12345;
     auto output_token_ids = torch::empty({1, 3}, torch::kInt32);
     auto data             = output_token_ids.data_ptr<int>();
     for (int i = 0; i < 3; ++i) {
@@ -175,7 +177,9 @@ TEST_F(QueryConverterTest, testTransOutput) {
     GenerateOutput  res;
     res.output_ids            = output_token_ids;
     res.finished              = true;
-    res.aux_info.cost_time_us = 1000;
+    res.aux_info.cost_time_us             = long_duration_us;
+    res.aux_info.first_token_cost_time_us = long_duration_us - 1;
+    res.aux_info.wait_time_us             = long_duration_us - 2;
     res.aux_info.iter_count   = 9;
     res.aux_info.input_len    = 8;
     res.aux_info.output_len   = 7;
@@ -192,7 +196,9 @@ TEST_F(QueryConverterTest, testTransOutput) {
 
     auto& output_pb   = outputs_pb.flatten_output();
     auto  aux_info_pb = output_pb.aux_info(0);
-    EXPECT_EQ(aux_info_pb.cost_time_us(), 1000);
+    EXPECT_EQ(aux_info_pb.cost_time_us(), long_duration_us);
+    EXPECT_EQ(aux_info_pb.first_token_cost_time_us(), long_duration_us - 1);
+    EXPECT_EQ(aux_info_pb.wait_time_us(), long_duration_us - 2);
     EXPECT_EQ(aux_info_pb.iter_count(), 9);
     EXPECT_EQ(aux_info_pb.input_len(), 8);
     EXPECT_EQ(aux_info_pb.output_len(), 7);
