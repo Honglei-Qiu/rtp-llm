@@ -34,3 +34,12 @@ py_test(
         "//rtp_llm:config",
     ],
 )
+
+py_test(
+    name = "deepseek_config_dtype_test",
+    srcs = ["deepseek_config_dtype_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    exec_properties = {'gpu':'H20'},
+)
