@@ -124,6 +124,16 @@ py_test(
 )
 
 py_test(
+    name = "openai_response_model_test",
+    srcs = [
+        "openai_response_model_test.py",
+    ],
+    data = [
+        "//rtp_llm:openai/openai_endpoint.py",
+    ],
+)
+
+py_test(
     name = "server_test",
     srcs = [
         "server_test.py",
