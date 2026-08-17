@@ -98,6 +98,8 @@ class GenerateStreamTest: public DeviceTestBase {
 protected:
 };
 
+class GenerateStreamStopUpdateTest: public EngineBaseTest {};
+
 template<typename T>
 void waitForConsumer(std::future<T>& future, const std::shared_ptr<NormalGenerateStream>& stream) {
     const auto status = future.wait_for(std::chrono::seconds(5));
@@ -128,6 +130,194 @@ TEST_F(GenerateStreamTest, testGenerateStreamReuseCacheMethod) {
     // flip back to true and verify
     stream->generate_input_->generate_config->reuse_cache = true;
     ASSERT_TRUE(stream->reuseCache());
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstDoesNotMatchEosBeforeMinNewTokens) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {0, 2, 3});
+    stream->generate_input_->generate_config->min_new_tokens = 3;
+
+    ASSERT_FALSE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 4);
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstMatchesEosAtMinNewTokens) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {1, 2, 0});
+    stream->generate_input_->generate_config->min_new_tokens = 3;
+
+    ASSERT_TRUE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 4);
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstStopWordUsesEndPositionForMinNewTokens) {
+    auto builder = GenerateStreamBuilder();
+
+    auto early_stop = builder.createDecoderStream({9}, {1, 2, 3});
+    early_stop->generate_input_->generate_config->min_new_tokens = 3;
+    early_stop->generate_input_->generate_config->stop_words_list = {{1}};
+    ASSERT_FALSE(early_stop->needFinish());
+    ASSERT_EQ(early_stop->seqLength(), 4);
+
+    auto boundary_stop = builder.createDecoderStream({9}, {1, 2, 3});
+    boundary_stop->generate_input_->generate_config->min_new_tokens = 3;
+    boundary_stop->generate_input_->generate_config->stop_words_list = {{2, 3}};
+    ASSERT_TRUE(boundary_stop->needFinish());
+    ASSERT_EQ(boundary_stop->seqLength(), 4);
+}
+
+TEST_F(GenerateStreamTest, testEmptyStopWordDoesNotMatch) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9, 10}, {11});
+    stream->generate_input_->generate_config->stop_words_list = {{}};
+
+    ASSERT_FALSE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 3);
+}
+
+TEST_F(GenerateStreamTest, testStopWordLongerThanSequenceDoesNotMatch) {
+    // Documents the outcome only. Deleting the `i < stop_words.size()` guard does not make
+    // this fail: begin_index then wraps, the comparison fails anyway, and the function still
+    // returns false. The guard is also unreachable through its sole production caller, whose
+    // per-pattern floor already exceeds the pattern length — pinning it deterministically
+    // would need a sanitizer build to catch the wrapped read.
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9, 10}, {11});
+
+    ASSERT_FALSE(stream->completeTokenIdsPtr()->matchStopWordsList(0, {1, 2, 3, 4}, 1));
+    ASSERT_EQ(stream->seqLength(), 3);
+}
+
+TEST_F(GenerateStreamTest, testStopWordStraddlingTwoStepsIsFound) {
+    // Only fixture spanning two steps, so it is the only one where the persistent start
+    // position exceeds the per-pattern floor. The vetoed half below is red on the frozen
+    // base: the base gates min_new_tokens per step, and that gate is open at sequence
+    // length 5, so the base finishes at 4 where this revision does not. The found half is
+    // the control — it behaves identically either way.
+    const auto append_step = [](const GenerateStreamPtr& stream, const std::vector<int>& tokens) {
+        auto complete_ids = stream->completeTokenIds();
+        std::memcpy(complete_ids.data_ptr<int32_t>() + stream->seqLength(),
+                    tokens.data(),
+                    tokens.size() * sizeof(int));
+        stream->setSeqLength(stream->seqLength() + tokens.size());
+    };
+
+    auto builder = GenerateStreamBuilder();
+    auto found   = builder.createDecoderStream({9}, {1, 2});
+    found->generate_input_->generate_config->stop_words_list = {{2, 3}};
+    append_step(found, {3, 4});
+
+    ASSERT_TRUE(found->needFinish());
+    // Truncated at the pattern's end, which is the first token of the second step.
+    ASSERT_EQ(found->seqLength(), 4);
+
+    // Same straddle, but min_new_tokens outranks the pattern length and vetoes it.
+    auto vetoed = builder.createDecoderStream({9}, {1, 2});
+    vetoed->generate_input_->generate_config->stop_words_list = {{2, 3}};
+    vetoed->generate_input_->generate_config->min_new_tokens  = 4;
+    append_step(vetoed, {3, 4});
+
+    ASSERT_FALSE(vetoed->needFinish());
+    ASSERT_EQ(vetoed->seqLength(), 5);
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstScansEosBeforeMaxLengthFinish) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {1, 0, 2});
+    stream->generate_input_->generate_config->min_new_tokens = 2;
+    stream->generate_input_->generate_config->max_new_tokens = 3;
+
+    ASSERT_TRUE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 3);
+}
+
+TEST_F(GenerateStreamStopUpdateTest, updateTruncatesSpecBurstAtEosBeforeMaxLength) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = std::dynamic_pointer_cast<NormalGenerateStream>(builder.createContextStream({9}));
+    stream->generate_input_->generate_config->min_new_tokens = 2;
+    stream->generate_input_->generate_config->max_new_tokens = 3;
+    stream->generate_status_->status.store(StreamState::RUNNING);
+
+    const auto new_tokens = torch::tensor({{1, 0, 2}}, torch::kInt32);
+    stream->update({new_tokens,
+                    3,
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    torch::Tensor(),
+                    true,
+                    false});
+
+    EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{9, 1, 0}));
+
+    auto output = stream->nextOutput();
+    ASSERT_TRUE(output.ok());
+    ASSERT_EQ(output.value().generate_outputs.size(), 1);
+    EXPECT_TRUE(torch::equal(output.value().generate_outputs[0].output_ids,
+                             torch::tensor({{1, 0}}, torch::kInt32)));
+
+    EXPECT_EQ(stream->moveToNext(), StreamState::FINISHED);
+    EXPECT_TRUE(stream->isFinished());
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstScansStopWordBeforeMaxLengthFinish) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {1, 2, 3});
+    stream->generate_input_->generate_config->max_new_tokens  = 3;
+    stream->generate_input_->generate_config->stop_words_list = {{2}};
+
+    ASSERT_TRUE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 3);
+}
+
+TEST_F(GenerateStreamTest, testSpecBurstChoosesEarliestStopAcrossPatterns) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {1, 2, 3});
+    stream->generate_input_->generate_config->stop_words_list = {{3}, {1}};
+
+    ASSERT_TRUE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 2);
+}
+
+TEST_F(GenerateStreamTest, testIgnoreEosSkipsEosAndSingletonEosStop) {
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({9}, {0});
+    stream->generate_input_->generate_config->ignore_eos      = true;
+    stream->generate_input_->generate_config->stop_words_list = {{0}};
+
+    ASSERT_FALSE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 2);
+}
+
+TEST_F(GenerateStreamTest, testStopWordWindowNeverReachesIntoPrompt) {
+    // The prompt tail {9} is the head of the stop pattern {9, 42}, so the window ending at
+    // the first generated token spans one prompt token and one generated token. With
+    // min_new_tokens 0 the previous bound permitted exactly that, finishing the request
+    // after a single generated token; and because the Python layer inspects only generated
+    // ids, the marker fragment would be neither detected nor stripped.
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({8, 9}, {42, 50});
+    stream->generate_input_->generate_config->stop_words_list = {{9, 42}};
+
+    ASSERT_FALSE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 4);
+}
+
+TEST_F(GenerateStreamTest, testStopWordEntirelyWithinGeneratedStillMatches) {
+    // Positive control: same shape, but the pattern lies wholly inside the generated
+    // tokens, so raising the bound must not suppress it.
+    auto builder = GenerateStreamBuilder();
+    auto stream  = builder.createDecoderStream({8, 9}, {42, 50});
+    stream->generate_input_->generate_config->stop_words_list = {{42, 50}};
+
+    ASSERT_TRUE(stream->needFinish());
+    ASSERT_EQ(stream->seqLength(), 4);
 }
 
 TEST_F(GenerateStreamTest, zeroWaitTimeoutBlocksUntilOutputIsPublished) {
