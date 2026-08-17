@@ -59,3 +59,14 @@ cc_test(
     copts = ["-fno-access-control"] + copts(),
     exec_properties = {'gpu':'H20'},
 )
+
+cc_test(
+    name = "tcp_messager_lifetime_test",
+    srcs = ["TcpMessagerLifetimeTest.cpp"],
+    deps = [
+        "//rtp_llm/cpp/disaggregate/cache_store:cache_store",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+    copts = ["-fno-access-control"] + copts(),
+)
