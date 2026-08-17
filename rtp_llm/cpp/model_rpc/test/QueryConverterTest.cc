@@ -1,7 +1,9 @@
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 
 #define private public
@@ -18,6 +20,30 @@ using namespace std;
 namespace rtp_llm {
 
 class QueryConverterTest: public DeviceTestBase {};
+
+namespace {
+
+// All four shape/payload guards throw std::invalid_argument, so a type-only expectation
+// lets them substitute for each other: deleting the negative-dimension guard still throws,
+// from the int64 guard instead. Matching the message is what makes each guard's test die
+// when that specific guard is removed.
+::testing::AssertionResult throwsInvalidArgumentContaining(const std::function<void()>& call,
+                                                           const std::string&           needle) {
+    try {
+        call();
+    } catch (const std::invalid_argument& error) {
+        const std::string message = error.what();
+        if (message.find(needle) != std::string::npos) {
+            return ::testing::AssertionSuccess();
+        }
+        return ::testing::AssertionFailure() << "message \"" << message << "\" lacks \"" << needle << "\"";
+    } catch (const std::exception& error) {
+        return ::testing::AssertionFailure() << "threw a different type: " << error.what();
+    }
+    return ::testing::AssertionFailure() << "did not throw";
+}
+
+}  // namespace
 
 TEST_F(QueryConverterTest, testTransInput) {
     GenerateInputPB input;
@@ -287,7 +313,188 @@ TEST_F(QueryConverterTest, TransTensorPB_NonContiguous) {
 TEST_F(QueryConverterTest, TransTensorPB_UnsupportedType) {
     torch::Tensor tensor = torch::ones({1}, torch::kInt64);
     TensorPB      tensor_pb;
+    tensor_pb.add_shape(7);
+    tensor_pb.set_fp32_data(std::string(sizeof(float), '\0'));
+
     EXPECT_THROW(QueryConverter::transTensorPB(&tensor_pb, tensor), std::runtime_error);
+    ASSERT_EQ(tensor_pb.shape_size(), 1);
+    EXPECT_EQ(tensor_pb.shape(0), 7);
+    EXPECT_EQ(tensor_pb.fp32_data().size(), sizeof(float));
+}
+
+TEST_F(QueryConverterTest, TransTensorRejectsOversizedPayload) {
+    TensorPB tensor_pb;
+    tensor_pb.set_data_type(TensorPB::FP32);
+    tensor_pb.add_shape(1);
+    tensor_pb.set_fp32_data(std::string(2 * sizeof(float), '\0'));
+
+    EXPECT_THROW(QueryConverter::transTensor(tensor_pb), std::invalid_argument);
+}
+
+TEST_F(QueryConverterTest, TransTensorRejectsTruncatedAndUnexpectedPayloads) {
+    TensorPB tensor_pb;
+    tensor_pb.set_data_type(TensorPB::FP32);
+    tensor_pb.add_shape(2);
+    tensor_pb.set_fp32_data(std::string(sizeof(float), '\0'));
+    EXPECT_THROW(QueryConverter::transTensor(tensor_pb), std::invalid_argument);
+
+    tensor_pb.set_fp32_data(std::string(2 * sizeof(float), '\0'));
+    tensor_pb.set_int32_data(std::string(2 * sizeof(int32_t), '\0'));
+    EXPECT_THROW(QueryConverter::transTensor(tensor_pb), std::invalid_argument);
+}
+
+TEST_F(QueryConverterTest, TransTensorRejectsInvalidShape) {
+    TensorPB negative_pb;
+    negative_pb.set_data_type(TensorPB::FP16);
+    negative_pb.add_shape(-1);
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(negative_pb); },
+                                                "negative dimension"));
+
+    // (2^63-1) * 2 does not overflow size_t, so this reaches the int64 element limit rather
+    // than the size_t overflow guard above it.
+    TensorPB over_int64_pb;
+    over_int64_pb.set_data_type(TensorPB::FP16);
+    over_int64_pb.add_shape(std::numeric_limits<int64_t>::max());
+    over_int64_pb.add_shape(2);
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(over_int64_pb); },
+                                                "exceeds the tensor limit"));
+
+    // 4 * 2^62 wraps size_t, so the running product must be rejected before it is computed.
+    TensorPB element_overflow_pb;
+    element_overflow_pb.set_data_type(TensorPB::FP16);
+    element_overflow_pb.add_shape(4);
+    element_overflow_pb.add_shape(int64_t{1} << 62);
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(element_overflow_pb); },
+                                                "element count overflows size_t"));
+
+    // 2^62 elements is under the int64 limit, but 2^62 * 4 bytes wraps size_t, so only the
+    // byte-count guard catches this one.
+    TensorPB byte_overflow_pb;
+    byte_overflow_pb.set_data_type(TensorPB::FP32);
+    byte_overflow_pb.add_shape(int64_t{1} << 62);
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(byte_overflow_pb); },
+                                                "byte count overflows size_t"));
+}
+
+TEST_F(QueryConverterTest, TransTensorRejectsImplausibleRank) {
+    // All-zero dimensions is the payload that slipped past every other guard: the element
+    // count stays 0, so the payload-size comparison passes, yet the shape vector is still
+    // built from the declared rank before any check ran.
+    TensorPB at_limit_pb;
+    at_limit_pb.set_data_type(TensorPB::FP32);
+    for (int dimension = 0; dimension < 64; ++dimension) {
+        at_limit_pb.add_shape(0);
+    }
+    const auto at_limit = QueryConverter::transTensor(at_limit_pb);
+    EXPECT_EQ(at_limit.dim(), 64);
+    EXPECT_EQ(at_limit.numel(), 0);
+
+    TensorPB over_limit_pb;
+    over_limit_pb.set_data_type(TensorPB::FP32);
+    for (int dimension = 0; dimension < 65; ++dimension) {
+        over_limit_pb.add_shape(0);
+    }
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(over_limit_pb); },
+                                                "rank exceeds 64"));
+}
+
+TEST_F(QueryConverterTest, TransTensorRoundTripsFp16Payload) {
+    const auto tensor = torch::tensor({1.5, -2.25, 3.0}, torch::kFloat16);
+    TensorPB   tensor_pb;
+    QueryConverter::transTensorPB(&tensor_pb, tensor);
+
+    EXPECT_EQ(tensor_pb.data_type(), TensorPB::FP16);
+    EXPECT_EQ(tensor_pb.fp16_data().size(), 3 * sizeof(c10::Half));
+    EXPECT_TRUE(tensor_pb.fp32_data().empty());
+
+    const auto restored = QueryConverter::transTensor(tensor_pb);
+    EXPECT_EQ(restored.scalar_type(), torch::kFloat16);
+    EXPECT_EQ(restored.sizes(), torch::IntArrayRef({3}));
+    EXPECT_TRUE(torch::equal(restored, tensor));
+
+    // A payload sized for FP32 must not pass as three FP16 elements.
+    tensor_pb.set_fp16_data(std::string(3 * sizeof(float), '\0'));
+    EXPECT_TRUE(throwsInvalidArgumentContaining([&] { QueryConverter::transTensor(tensor_pb); },
+                                                "does not match its shape and data type"));
+}
+
+TEST_F(QueryConverterTest, TransTensorAcceptsUnsetMessageAsEmptyTensor) {
+    // rtp_llm/utils/grpc_util.py trans_from_tensor sends a bare TensorPB for a None or
+    // empty tensor, and URL-based multimodal inputs always take that path.
+    const auto empty = QueryConverter::transTensor(TensorPB());
+    EXPECT_EQ(empty.numel(), 0);
+    EXPECT_EQ(empty.sizes(), torch::IntArrayRef({0}));
+    EXPECT_EQ(empty.scalar_type(), torch::kFloat32);
+}
+
+TEST_F(QueryConverterTest, TransTensorAcceptsScalarAndZeroSizedShape) {
+    TensorPB scalar_pb;
+    scalar_pb.set_data_type(TensorPB::INT32);
+    const int32_t value = 42;
+    scalar_pb.set_int32_data(&value, sizeof(value));
+
+    const auto scalar = QueryConverter::transTensor(scalar_pb);
+    EXPECT_EQ(scalar.dim(), 0);
+    EXPECT_EQ(scalar.item<int32_t>(), value);
+
+    TensorPB empty_pb;
+    empty_pb.set_data_type(TensorPB::BF16);
+    empty_pb.add_shape(2);
+    empty_pb.add_shape(0);
+    empty_pb.add_shape(3);
+
+    const auto empty = QueryConverter::transTensor(empty_pb);
+    EXPECT_EQ(empty.sizes(), torch::IntArrayRef({2, 0, 3}));
+    EXPECT_EQ(empty.numel(), 0);
+}
+
+TEST_F(QueryConverterTest, TransTensorPBClearsReusedMessage) {
+    TensorPB tensor_pb;
+    tensor_pb.add_shape(9);
+    tensor_pb.set_fp32_data(std::string(sizeof(float), '\0'));
+
+    const auto tensor = torch::tensor({7, 8}, torch::kInt32);
+    QueryConverter::transTensorPB(&tensor_pb, tensor);
+
+    ASSERT_EQ(tensor_pb.shape_size(), 1);
+    EXPECT_EQ(tensor_pb.shape(0), 2);
+    EXPECT_TRUE(tensor_pb.fp32_data().empty());
+    EXPECT_EQ(tensor_pb.int32_data().size(), 2 * sizeof(int32_t));
+    EXPECT_TRUE(torch::equal(QueryConverter::transTensor(tensor_pb), tensor));
+}
+
+TEST_F(QueryConverterTest, TransTensorPBRoundTripsZeroSizedTensor) {
+    const auto tensor = torch::empty({2, 0, 3}, torch::kBFloat16);
+    TensorPB  tensor_pb;
+
+    QueryConverter::transTensorPB(&tensor_pb, tensor);
+
+    ASSERT_EQ(tensor_pb.shape_size(), 3);
+    EXPECT_EQ(tensor_pb.shape(0), 2);
+    EXPECT_EQ(tensor_pb.shape(1), 0);
+    EXPECT_EQ(tensor_pb.shape(2), 3);
+    EXPECT_TRUE(tensor_pb.bf16_data().empty());
+    const auto restored = QueryConverter::transTensor(tensor_pb);
+    EXPECT_EQ(restored.sizes(), tensor.sizes());
+    EXPECT_EQ(restored.scalar_type(), tensor.scalar_type());
+}
+
+TEST_F(QueryConverterTest, TransTensorPBFailureLeavesReusedMessageUnchanged) {
+    TensorPB tensor_pb;
+    tensor_pb.set_data_type(TensorPB::INT32);
+    tensor_pb.add_shape(1);
+    const int32_t value = 17;
+    tensor_pb.set_int32_data(&value, sizeof(value));
+    const auto original = tensor_pb.SerializeAsString();
+
+    // A sparse tensor passes the dtype switch and the sizes() loop, then contiguous() rejects
+    // it — so the failure lands after the local message has been populated, which is exactly
+    // the window the Swap is meant to make invisible. A Meta tensor cannot be used here:
+    // data_ptr() checks has_storage() but not storage_initialized(), so it returns nullptr
+    // without throwing and set_fp32_data(nullptr, 8) segfaults.
+    const auto uncopyable = torch::zeros({2, 2}, torch::kFloat32).to_sparse();
+    EXPECT_THROW(QueryConverter::transTensorPB(&tensor_pb, uncopyable), std::exception);
+    EXPECT_EQ(tensor_pb.SerializeAsString(), original);
 }
 
 // Typed grammar fields wire as google.protobuf.StringValue → Optional<string>.

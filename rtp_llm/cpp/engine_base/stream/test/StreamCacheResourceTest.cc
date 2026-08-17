@@ -779,6 +779,61 @@ TEST_F(StreamCacheResourceTest, testP2PSideChannelRestoresZeroFirstTokenAndMtpSt
     EXPECT_TRUE(stream_->getLastHiddenStatesGpu().defined());
 }
 
+TEST_F(StreamCacheResourceTest, testP2PSideChannelFailsStreamOnMalformedSpeculativePayload) {
+    prepareResourceWithInputTokens({1, 2, 3}, /*reuse_cache=*/true);
+    stream_->vocab_size_ = 16;
+    auto& resource = stream_->streamCacheResource();
+
+    auto kv_resource = std::make_shared<KVCacheResource>();
+    kv_resource->setDeviceReuseBlockNum(1);
+    kv_resource->setMemoryReuseBlockNum(1);
+
+    auto server_call_result                                  = std::make_shared<PrefillLoadCaller::Result>();
+    server_call_result->side_channel_payload.has_data        = true;
+    server_call_result->side_channel_payload.first_token_id  = 0;
+    server_call_result->side_channel_payload.total_reuse_len = 2;
+    server_call_result->side_channel_payload.local_reuse_len = 2;
+    server_call_result->side_channel_payload.propose_tokens  = {0, 7};
+    // Three float32 elements declared but only one element's worth of bytes. The payload has
+    // to stay non-empty, otherwise tensorPbHasPayload skips the conversion and nothing is
+    // exercised. Before the fix this threw out of updateReuseLengthsFromContext and ran all
+    // the way to NormalEngine::loop(), which has no handler, losing the rank.
+    auto& malformed = server_call_result->side_channel_payload.propose_probs;
+    malformed.set_data_type(TensorPB::FP32);
+    malformed.add_shape(1);
+    malformed.add_shape(3);
+    malformed.set_fp32_data(std::string(sizeof(float), '\0'));
+    TensorPbConvert::torchToPb(&server_call_result->side_channel_payload.propose_hidden,
+                               torch::tensor({{0.3f, 0.4f}}, torch::kFloat32));
+    // Applied by a later section of the same function and unrelated to speculation. An earlier
+    // revision returned on decode failure and silently dropped these, so pin that they survive.
+    server_call_result->side_channel_payload.position_ids = {0, 1, 2, 3};
+
+    auto p2p_ctx = std::make_shared<P2PConnectorAsyncReadContext>(
+        kv_resource,
+        std::shared_ptr<P2PBroadcastClient::Result>(),
+        server_call_result,
+        std::shared_ptr<DecodeSchedulerMetricsCollector>(),
+        /*transfer_not_done_hold_ms=*/0);
+    auto read_context = std::make_shared<FusedAsyncReadContext>(
+        std::make_shared<FusedAsyncContext>(std::vector<std::shared_ptr<AsyncContext>>{}), kv_resource, nullptr);
+    read_context->setFusedReadContext(
+        std::make_shared<FusedAsyncContext>(std::vector<std::shared_ptr<AsyncContext>>{
+            std::static_pointer_cast<AsyncContext>(p2p_ctx)}));
+
+    EXPECT_NO_THROW(resource.updateReuseLengthsFromContext(read_context));
+
+    // The request is failed rather than continued or silently degraded: publishing a buffer
+    // whose all_probs is undefined trips a noreturn check in the MTP processor, and skipping
+    // does too, because the executor then synthesizes an equally undefined buffer.
+    EXPECT_TRUE(stream_->hasError());
+    EXPECT_TRUE(stream_->getSPOutputBuffer() == nullptr);
+    // The first token was applied by an earlier section and stays. Position ids are applied by
+    // a later section that is deliberately not reached — a failed request does not need them.
+    EXPECT_EQ(stream_->completeTokenIdsVec(), std::vector<int>({1, 2, 3, 0}));
+    EXPECT_FALSE(stream_->getContextPositionIds().defined());
+}
+
 TEST_F(StreamCacheResourceTest, testInitKVBlock_SecondCallDoesNotOverwriteReuseLength) {
     // Simulates PD separation: initKVBlock called twice on the same stream.
     // First call sets reuse length via asyncLoadCache+loadCacheDone; second call should NOT overwrite it with 0.

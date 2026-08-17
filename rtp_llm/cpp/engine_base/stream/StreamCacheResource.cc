@@ -207,7 +207,46 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
     // 3. Speculative proposal info. Unlike the gRPC handoff, this channel
     // carries real reuse accounting (block 2) and initKVBlock refreshes the
     // positions after allocation, so proposal-less streams keep them intact.
+    // Every tensor the peer sent is decoded and checked usable before any speculative state is
+    // configured. A byte-level guard alone is not enough: a well-formed but zero-element payload
+    // passes it, raises nothing, and would publish an unusable tensor into a noreturn check in
+    // the MTP processor. Skipping is not a safe outcome either — with no buffer published the
+    // MTP executor synthesizes one with an undefined all_probs and that same check fires — so a
+    // bad speculative payload fails this one request. reportErrorWithoutLock is the correct
+    // entry point: the caller already holds the stream mutex and it is not recursive.
     if (!payload->propose_tokens.empty()) {
+        const auto decode_field = [&](const TensorPB& field, const char* name, torch::Tensor& out) {
+            if (!tensorPbHasPayload(field)) {
+                return true;
+            }
+            out = TensorPbConvert::pbToTorch(field).to(torch::kCUDA);
+            if (out.defined() && out.numel() > 0) {
+                return true;
+            }
+            // The byte-level guard above only proves the field was populated; a well-formed but
+            // zero-element payload gets this far and would publish an unusable tensor.
+            RTP_LLM_LOG_WARNING("empty P2P speculative %s, stream: [%ld]", name, stream->streamId());
+            return false;
+        };
+        torch::Tensor decoded_all_probs;
+        torch::Tensor decoded_hidden_states;
+        try {
+            if (!decode_field(payload->propose_probs, "propose_probs", decoded_all_probs)
+                || !decode_field(payload->propose_hidden, "propose_hidden", decoded_hidden_states)) {
+                stream->reportErrorWithoutLock(ErrorCode::EXECUTION_EXCEPTION,
+                                               "P2P speculative side channel carries an empty tensor");
+                return false;
+            }
+        } catch (const std::invalid_argument& error) {
+            RTP_LLM_LOG_WARNING("malformed P2P speculative side channel, stream: [%ld], error: %s",
+                                stream->streamId(),
+                                error.what());
+            stream->reportErrorWithoutLock(ErrorCode::EXECUTION_EXCEPTION,
+                                           std::string("malformed P2P speculative side channel: ") + error.what());
+            return false;
+        }
+        // DSv4 collapsed the reuse/edit/token-index setters into this helper; keep it so the
+        // position accounting stays in sync with the gRPC handoff path.
         stream->initSpeculativeHandoffPositions();
         stream->setContainProposeToken(true);
         stream->setProposeToken(payload->propose_tokens);
@@ -221,12 +260,8 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
 
         const auto cuda_i32                  = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
         sp_output_buffer->propose_tokens_gpu = sp_output_buffer->tokens.to(cuda_i32, /*non_blocking=*/true);
-        if (tensorPbHasPayload(payload->propose_probs)) {
-            sp_output_buffer->all_probs = TensorPbConvert::pbToTorch(payload->propose_probs).to(torch::kCUDA);
-        }
-        if (tensorPbHasPayload(payload->propose_hidden)) {
-            sp_output_buffer->hidden_states = TensorPbConvert::pbToTorch(payload->propose_hidden).to(torch::kCUDA);
-        }
+        sp_output_buffer->all_probs          = std::move(decoded_all_probs);
+        sp_output_buffer->hidden_states      = std::move(decoded_hidden_states);
 
         stream->setSPOutputBuffer(sp_output_buffer);
 
