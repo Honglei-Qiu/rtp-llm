@@ -1,5 +1,6 @@
 #include <memory>
 #include <chrono>
+#include <stdexcept>
 #include <c10/core/InferenceMode.h>
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
@@ -151,7 +152,18 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
 }
 
 ErrorInfo LocalRpcServer::prepareInput(const GenerateInputPB& input_pb, std::shared_ptr<GenerateInput>& output) {
-    output = QueryConverter::transQuery(&input_pb);
+    try {
+        output = QueryConverter::transQuery(&input_pb);
+    } catch (const std::invalid_argument& error) {
+        // Both callers are sync gRPC handlers with no try around them, so an escaping
+        // exception would terminate the process and every co-resident request with it.
+        return ErrorInfo(ErrorCode::ERROR_GENERATE_CONFIG_FORMAT, error.what());
+    } catch (const std::exception& error) {
+        // Also must not escape, but this is not the caller's fault: the tensor conversion on
+        // this path throws c10::Error, and reporting a server fault as a malformed request
+        // would keep a real incident from surfacing.
+        return ErrorInfo(ErrorCode::EXECUTION_EXCEPTION, error.what());
+    }
     if (mm_processor_ != nullptr && output->multimodal_inputs) {
         RTP_LLM_PROFILE_SCOPE("rpc.mm_update_features");
         auto mm_res = mm_processor_->updateMultimodalFeatures(output);

@@ -41,7 +41,9 @@ import torch
 from rtp_llm.config.generate_config import GenerateConfig, RoleAddr, RoleType, ThinkingMode
 from rtp_llm.config.log_config import setup_logging
 from rtp_llm.config.response_format_compiler import ReasoningFormat
+from rtp_llm.config.exceptions import FtRuntimeException
 from rtp_llm.cpp.model_rpc.model_rpc_client import (
+    MAX_UNIQUE_KEY_LENGTH,
     ModelRpcClient,
     StreamState,
     trans_input,
@@ -334,6 +336,97 @@ class ModelRpcClientTest(TestCase):
         self.assertEqual(len(elements), 2)
         self.assertEqual(elements[0]["type"], "tag")
         self.assertEqual(elements[1]["type"], "json_schema")
+
+    def test_trans_input_carries_unique_key(self):
+        generate_config = GenerateConfig(unique_key="reuse-session-a")
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=generate_config,
+            request_id=123,
+            mm_inputs=[],
+        )
+
+        input_pb = trans_input(input_py)
+
+        self.assertEqual(input_pb.generate_config.unique_key, "reuse-session-a")
+
+    def test_trans_input_does_not_synthesize_unique_key_when_unset(self):
+        # This pins only that no fallback is synthesised (e.g. from request_id): the
+        # empty result itself is also both defaults, so it cannot detect a deleted
+        # assignment. What an empty key means downstream is not settled — reviewers
+        # traced the prefill guard skipping, and disagreed on whether the decode guard
+        # fails the request or is swallowed by a default no-op setStop — so this test
+        # deliberately asserts nothing about it.
+        generate_config = GenerateConfig()
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=generate_config,
+            request_id=124,
+            mm_inputs=[],
+        )
+
+        input_pb = trans_input(input_py)
+
+        self.assertEqual(input_pb.generate_config.unique_key, "")
+
+    def test_trans_input_preserves_unique_key_verbatim(self):
+        # Mixed case, so lower-casing or case-folding the key changes it — the previous
+        # CJK literal was a fixed point of both, and of all four normalisation forms, so
+        # it proved nothing. Trimming cannot be covered by any accepted literal, since
+        # the charset rule below rejects whitespace outright.
+        verbatim = ".ReUse.Session.A1b2.:-"
+        generate_config = GenerateConfig(unique_key=verbatim)
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=generate_config,
+            request_id=125,
+            mm_inputs=[],
+        )
+
+        input_pb = trans_input(input_py)
+
+        self.assertEqual(input_pb.generate_config.unique_key, verbatim)
+
+    def test_trans_input_rejects_overlong_unique_key(self):
+        generate_config = GenerateConfig(unique_key="a" * (MAX_UNIQUE_KEY_LENGTH + 1))
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=generate_config,
+            request_id=126,
+            mm_inputs=[],
+        )
+
+        with self.assertRaisesRegex(FtRuntimeException, "at most 128 characters"):
+            trans_input(input_py)
+
+    def test_trans_input_accepts_unique_key_at_length_limit(self):
+        at_limit = "a" * MAX_UNIQUE_KEY_LENGTH
+        generate_config = GenerateConfig(unique_key=at_limit)
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=generate_config,
+            request_id=127,
+            mm_inputs=[],
+        )
+
+        self.assertEqual(trans_input(input_py).generate_config.unique_key, at_limit)
+
+    def test_trans_input_rejects_unique_key_with_derivation_separator(self):
+        # "_" is what P2PKeyUtil joins the derived key parts with, so allowing it in the
+        # caller-supplied part lets two different requests derive one key: for instance
+        # ("sess", 3, "k_0_9_tagz", 1) and ("sess_3_tagk_0", 9, "z", 1) both give
+        # "sess_3_tagk_0_9_tagz_1".
+        for rejected in ("reuse_session", "reuse session", "reuse/session", "reuse\u4e2d"):
+            with self.subTest(unique_key=rejected):
+                generate_config = GenerateConfig(unique_key=rejected)
+                input_py = GenerateInput(
+                    token_ids=torch.tensor([1, 2, 3]),
+                    generate_config=generate_config,
+                    request_id=128,
+                    mm_inputs=[],
+                )
+                with self.assertRaisesRegex(FtRuntimeException, "may only contain"):
+                    trans_input(input_py)
 
     @unittest.skip("need fix")
     def test_generate_stream(self):

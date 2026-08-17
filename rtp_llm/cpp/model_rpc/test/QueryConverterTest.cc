@@ -19,6 +19,42 @@ namespace rtp_llm {
 
 class QueryConverterTest: public DeviceTestBase {};
 
+TEST_F(QueryConverterTest, TransQueryValidatesUniqueKey) {
+    const auto make_input = [](const std::string& unique_key) {
+        GenerateInputPB input;
+        input.add_token_ids(0);
+        input.mutable_generate_config()->set_unique_key(unique_key);
+        return input;
+    };
+
+    // Exercises every allowed class — digits, both cases, '.', ':' and '-' — so dropping any
+    // of them from the C++ set turns this red. Still exactly 128 characters.
+    const std::string at_limit_key = std::string(118, 'a') + ".ReUse:1-b";
+    ASSERT_EQ(at_limit_key.size(), 128u);
+    auto at_limit = make_input(at_limit_key);
+    ASSERT_EQ(QueryConverter::transQuery(&at_limit)->generate_config->unique_key, at_limit_key);
+
+    // Both guards throw the same type, so match the message: a type-only expectation cannot
+    // tell "too long" from "bad character" and would survive swapping the two checks.
+    auto over_limit = make_input(std::string(129, 'a'));
+    try {
+        QueryConverter::transQuery(&over_limit);
+        FAIL() << "expected an over-length unique_key to be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("exceeds 128"), std::string::npos) << error.what();
+    }
+
+    // One case per rejected class. '_' matters most: it is the separator the P2P key
+    // derivation joins with, and permitting it in the caller-supplied part gives the
+    // derived key two pre-images instead of one.
+    for (const std::string& rejected : {"reuse_session", "reuse session", "reuse/session", "reuse\xe4\xb8\xad"}) {
+        SCOPED_TRACE(rejected);
+        auto input = make_input(rejected);
+        EXPECT_THROW(QueryConverter::transQuery(&input), std::invalid_argument);
+    }
+}
+
+
 TEST_F(QueryConverterTest, testTransInput) {
     GenerateInputPB input;
     input.mutable_request_info()->set_frontend_ip("10.0.0.1");
@@ -49,6 +85,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     generate_config_pb->set_calculate_loss(1);
     generate_config_pb->set_return_hidden_states(true);
     generate_config_pb->set_thinking_mode(GenerateConfigPB::THINKING_MODE_ADAPTIVE);
+    generate_config_pb->set_unique_key("reuse-session-a");
     for (int i = 0; i < 2; ++i) {
         auto* stop_words = generate_config_pb->mutable_stop_words_list()->add_rows();
         for (int j = 0; j < 3; ++j) {
@@ -85,6 +122,7 @@ TEST_F(QueryConverterTest, testTransInput) {
     ASSERT_TRUE(generate_config->return_hidden_states);
     ASSERT_FALSE(generate_config->return_logits);
     ASSERT_EQ(generate_config->thinking_mode, ThinkingMode::ADAPTIVE);
+    ASSERT_EQ(generate_config->unique_key, "reuse-session-a");
     ASSERT_EQ(generate_config->stop_words_list.size(), 2);
     vector<int> stop_words_1{0, 1, 2};
     vector<int> stop_words_2{3, 4, 5};

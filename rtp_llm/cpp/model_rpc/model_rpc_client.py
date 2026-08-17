@@ -1,6 +1,7 @@
 import functools
 import json
 import logging
+import re
 import time
 from typing import Any, AsyncGenerator, Dict, Optional, Union
 
@@ -100,6 +101,30 @@ def _trans_jsonable_options(
     _trans_jsonable_option(
         config_pb.structural_tag, "structural_tag", config.structural_tag
     )
+
+
+MAX_UNIQUE_KEY_LENGTH = 128
+_UNIQUE_KEY_PATTERN = re.compile(r"\A[0-9A-Za-z.:-]*\Z")
+
+
+def _validate_unique_key(unique_key: str) -> str:
+    # P2PKeyUtil::makePartitionLayerTagKey expands this into one key per layer, per cache
+    # tag and per receiving partition, so at Prefill CP16 -> Decode TP1 one request turns
+    # it into hundreds of derived strings. Validating here is bypass-proof because this is
+    # the only writer of the proto field, whereas GenerateConfig.update() sets attributes
+    # without running pydantic validators. Rejecting '_' keeps the caller-supplied part of
+    # the derived key unambiguous, since that is the separator the derivation uses.
+    if len(unique_key) > MAX_UNIQUE_KEY_LENGTH:
+        raise FtRuntimeException(
+            ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+            f"unique_key must be at most {MAX_UNIQUE_KEY_LENGTH} characters, got {len(unique_key)}",
+        )
+    if not _UNIQUE_KEY_PATTERN.match(unique_key):
+        raise FtRuntimeException(
+            ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+            "unique_key may only contain ASCII letters, digits, '.', ':' and '-'",
+        )
+    return unique_key
 
 
 def trans_input(input_py: GenerateInput):
@@ -247,6 +272,9 @@ def trans_input(input_py: GenerateInput):
     )
     generate_config_pb.enable_remote_cache = (
         input_py.generate_config.enable_remote_cache
+    )
+    generate_config_pb.unique_key = _validate_unique_key(
+        input_py.generate_config.unique_key
     )
     trans_option_cast(
         generate_config_pb, input_py.generate_config, "trace_id", functools.partial(str)

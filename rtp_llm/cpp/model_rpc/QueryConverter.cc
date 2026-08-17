@@ -4,6 +4,8 @@
 #include <optional>
 
 #include <numeric>
+#include <stdexcept>
+#include <string>
 
 #include "RPCPool.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -11,6 +13,9 @@
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 
 namespace rtp_llm {
+
+// Keep in step with MAX_UNIQUE_KEY_LENGTH in rtp_llm/cpp/model_rpc/model_rpc_client.py.
+constexpr size_t kMaxUniqueKeyLength = 128;
 
 #define TRANS_OPTIONAL(name)                                                                                           \
     if (config_proto->has_##name()) {                                                                                  \
@@ -203,6 +208,22 @@ std::shared_ptr<GenerateConfig> QueryConverter::transGenerateConfig(const Genera
     generate_config->enable_device_cache = config_proto->enable_device_cache();
     generate_config->enable_memory_cache = config_proto->enable_memory_cache();
     generate_config->enable_remote_cache = config_proto->enable_remote_cache();
+    // Bounded at this funnel because the P2P layer expands the key into one derived string
+    // per layer, per cache tag and per receiving partition, while proto3 imposes no length
+    // limit and the configured gRPC receive limit is unlimited internally. '_' is rejected
+    // because it is the separator the derivation uses, so allowing it in the caller-supplied
+    // part would let two different requests derive the same key.
+    const std::string& unique_key = config_proto->unique_key();
+    if (unique_key.size() > kMaxUniqueKeyLength) {
+        throw std::invalid_argument("generate_config.unique_key exceeds "
+                                    + std::to_string(kMaxUniqueKeyLength) + " characters");
+    }
+    if (unique_key.find_first_not_of("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.:-")
+        != std::string::npos) {
+        throw std::invalid_argument(
+            "generate_config.unique_key may only contain ASCII letters, digits, '.', ':' and '-'");
+    }
+    generate_config->unique_key = unique_key;
     TRANS_OPTIONAL(trace_id);
     TRANS_OPTIONAL(group_timeout);
 
