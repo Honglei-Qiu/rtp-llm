@@ -10,6 +10,7 @@
 #include "rtp_llm/cpp/api_server/ErrorResponse.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/api_server/AccessLogWrapper.h"
+#include "rtp_llm/cpp/api_server/RequestCapabilityValidator.h"
 
 using namespace autil::legacy;
 using namespace autil::legacy::json;
@@ -164,6 +165,9 @@ void InferenceService::inferResponse(int64_t                                    
     auto             start_time_ms = autil::TimeUtility::currentTimeInMilliSeconds();
     const auto       body          = request.GetBody();
     auto             req           = InferenceParsedRequest::extractRequest(body, model_config_, token_processor_);
+    for (const auto& generate_config : req.generate_configs) {
+        validateRequestCapabilities(*generate_config, *engine_);
+    }
     if (metric_reporter_) {
         metric_reporter_->reportQpsMetric(req.source);
     }

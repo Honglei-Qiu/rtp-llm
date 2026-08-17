@@ -46,15 +46,27 @@ cc_library(
 )
 
 cc_library(
+    name = "request_capability_predicate",
+    hdrs = ["RequestCapabilityPredicate.h"],
+    deps = [
+        "//rtp_llm/cpp/engine_base:engine_base",
+        "//rtp_llm/cpp/engine_base/stream:generate_config",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "http_api_server",
     srcs = glob([
         "*.cc",
     ]),
-    hdrs = glob([
-        "*.h",
-    ]),
+    hdrs = glob(
+        ["*.h"],
+        exclude = ["RequestCapabilityPredicate.h"],
+    ),
     deps = [
         ":openai",
+        ":request_capability_predicate",
         "//rtp_llm/cpp/engine_base:engine_base",
         "//rtp_llm/cpp/engine_base:weights_converter",
         "//rtp_llm/cpp/engine_base/stream:generate_config",

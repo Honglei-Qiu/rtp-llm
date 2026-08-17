@@ -61,6 +61,7 @@ cc_library(
         ":model_rpc_pool",
         ":rpc_error_code",
         ":tensor_pb_convert",
+        "//rtp_llm/cpp/api_server:request_capability_predicate",
         "//rtp_llm/cpp/cache:cache_types",
         "//rtp_llm/cpp/cache:batch_kv_cache_resource",
         "//rtp_llm/cpp/cache:kv_cache_transfer_planner",

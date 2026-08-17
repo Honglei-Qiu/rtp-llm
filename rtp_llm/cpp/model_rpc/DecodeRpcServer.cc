@@ -16,6 +16,7 @@
 #include "rtp_llm/cpp/utils/KVCacheUtils.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
 #include "rtp_llm/cpp/model_rpc/DecodeRpcServer.h"
+#include "rtp_llm/cpp/api_server/RequestCapabilityPredicate.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/LockFreeThreadPool.h"
@@ -178,6 +179,17 @@ void DecodeRpcServer::allocateResource(DecodeGenerateContext& decode_context) {
     RTP_LLM_LOG_DEBUG("request [%s] start to allocate resource", decode_context.request_key.c_str());
     auto input                        = QueryConverter::transQuery(&decode_context.allocate_request.input());
     decode_context.request_info       = input->request_info;
+    // The decode allocate path also reaches makeStream/enqueue via transQuery here, bypassing
+    // LocalRpcServer::prepareInput. Reject a speculative probability/logit request before a stream
+    // is created, so it cannot hit the undefined-tensor throw on the dispatch thread.
+    if (engine_ != nullptr && input->generate_config
+        && speculationRejectsRequest(*input->generate_config, *engine_)) {
+        string error_msg = "request: [" + decode_context.request_key
+                           + "] speculative decoding does not support probability or logit output";
+        RTP_LLM_LOG_ERROR(error_msg);
+        decode_context.error_status = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, error_msg);
+        return;
+    }
     auto generate_stream              = engine_->makeStream(input);
     decode_context.request_timeout_ms = generate_stream->getTimeoutMs();
 

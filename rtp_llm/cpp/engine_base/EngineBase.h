@@ -90,6 +90,13 @@ public:
         return false;
     }
 
+    // Broader than isMTPEagle/isEagle: any speculative executor (mtp, eagle, eagle3, vanilla,
+    // deterministic) produces undefined per-token probabilities, so capability checks that
+    // reject probability output under speculation must key on this rather than on the mode.
+    virtual bool hasSpeculativeExecutor() {
+        return false;
+    }
+
     virtual bool updateEplbConfig(const EPLBConfig& config) {
         return false;
     }

@@ -685,6 +685,12 @@ bool NormalEngine::isDSpark() {
     return propose_params_ && propose_params_->sp_type == SP_TYPE_DSPARK;
 }
 
+bool NormalEngine::hasSpeculativeExecutor() {
+    // propose_params_ being set is exactly what selects a speculative executor, for every
+    // sp_type, so this is the condition that governs whether probability output is available.
+    return propose_params_ != nullptr;
+}
+
 void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     if (isMTPEagle()) {
         int        propose_step   = sp_config.gen_num_per_cycle;

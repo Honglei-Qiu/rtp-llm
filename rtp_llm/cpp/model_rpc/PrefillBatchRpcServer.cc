@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/model_rpc/PrefillBatchRpcServer.h"
 
+#include "rtp_llm/cpp/api_server/RequestCapabilityPredicate.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/utils/AtomicUtil.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -1013,6 +1014,19 @@ grpc::Status PrefillBatchRpcServer::enqueueGroupStreams(std::vector<ReadySlot>& 
         if (prefill_context.isPriorityPreempted()) {
             rejectSlot(ready_slot,
                        preferPriorityPreemption(prefill_context, grpc::Status::OK),
+                       response);
+            continue;
+        }
+        // Batched P/D prefill reaches enqueueMultiple() bypassing the HTTP-layer capability
+        // check, exactly like the single-stream getRpcConnection() path. A probability/logit
+        // request under a speculative engine would otherwise hit an undefined tensor and throw
+        // on the NormalEngine::loop dispatch thread, which is not caught. Reject up-front.
+        if (engine_ != nullptr && prefill_context.generate_input
+            && prefill_context.generate_input->generate_config
+            && speculationRejectsRequest(*prefill_context.generate_input->generate_config, *engine_)) {
+            rejectSlot(ready_slot,
+                       grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                    "speculative decoding does not support probability or logit output"),
                        response);
             continue;
         }

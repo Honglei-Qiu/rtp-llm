@@ -11,6 +11,7 @@
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
+#include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 
 using namespace ::testing;
 
@@ -27,8 +28,42 @@ public:
     MOCK_METHOD(void, updateOutput, (const StreamUpdateInfo&), (override));
 };
 
+class StubSpeculativeEngine: public EngineBase {
+public:
+    explicit StubSpeculativeEngine(bool speculative):
+        EngineBase(EngineInitParams()), speculative_(speculative) {}
+
+    std::shared_ptr<GenerateStream> enqueue(const std::shared_ptr<GenerateInput>&) override {
+        return nullptr;
+    }
+    void                                      enqueue(std::shared_ptr<GenerateStream>&) override {}
+    absl::Status                              stop() override {
+        return absl::OkStatus();
+    }
+    absl::StatusOr<GenerateStreamPtr> preRun(const std::shared_ptr<GenerateInput>&, preRunMode) override {
+        return absl::UnimplementedError("stub");
+    }
+    KVCacheInfo getCacheStatusInfo(int64_t, bool) override {
+        return KVCacheInfo{};
+    }
+    bool hasSpeculativeExecutor() override {
+        return speculative_;
+    }
+
+private:
+    bool speculative_;
+};
+
 class TestLocalRpcServer: public LocalRpcServer {
 public:
+    void setEngine(std::shared_ptr<EngineBase> engine) {
+        engine_ = std::move(engine);
+    }
+
+    ErrorInfo prepare(const GenerateInputPB& input_pb, std::shared_ptr<GenerateInput>& output) {
+        return prepareInput(input_pb, output);
+    }
+
     grpc::Status poll(std::shared_ptr<GenerateStream>& stream) {
         return pollStreamOutput(nullptr, "request", nullptr, stream);
     }
@@ -232,6 +267,43 @@ TEST(LocalRpcServerTest, PollWritesFinalLocalOutputBeforeRemoteHandoff) {
     EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
     EXPECT_FALSE(normal_stream->stream_cache_resource_->isResourceReleased());
     EXPECT_FALSE(normal_stream->hasOutput());
+}
+
+TEST(LocalRpcServerTest, PrepareInputRejectsSpeculativeProbabilityRequest) {
+    TestLocalRpcServer server;
+    server.setEngine(std::make_shared<StubSpeculativeEngine>(/*speculative=*/true));
+
+    GenerateInputPB input_pb;
+    input_pb.set_request_id(1);
+    input_pb.add_token_ids(1);
+    input_pb.add_token_ids(2);
+    input_pb.add_token_ids(3);
+    input_pb.mutable_generate_config()->set_return_logits(true);
+
+    std::shared_ptr<GenerateInput> output;
+    const auto                     status = server.prepare(input_pb, output);
+
+    EXPECT_TRUE(status.hasError());
+    EXPECT_EQ(status.code(), ErrorCode::ERROR_GENERATE_CONFIG_FORMAT);
+}
+
+TEST(LocalRpcServerTest, PrepareInputAcceptsProbabilityRequestWithoutSpeculativeExecutor) {
+    TestLocalRpcServer server;
+    server.setEngine(std::make_shared<StubSpeculativeEngine>(/*speculative=*/false));
+
+    GenerateInputPB input_pb;
+    input_pb.set_request_id(1);
+    input_pb.add_token_ids(1);
+    input_pb.add_token_ids(2);
+    input_pb.add_token_ids(3);
+    input_pb.mutable_generate_config()->set_return_logits(true);
+
+    std::shared_ptr<GenerateInput> output;
+    const auto                     status = server.prepare(input_pb, output);
+
+    EXPECT_FALSE(status.hasError());
+    ASSERT_NE(output, nullptr);
+    EXPECT_TRUE(output->generate_config->return_logits);
 }
 
 }  // namespace rtp_llm

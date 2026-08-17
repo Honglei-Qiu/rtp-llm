@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
 #include "rtp_llm/cpp/model_rpc/PrefillRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
+#include "rtp_llm/cpp/api_server/RequestCapabilityPredicate.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/engine_base/Host.h"
@@ -218,6 +219,22 @@ void PrefillRpcServer::getRpcConnection(PrefillGenerateContext& prefill_context)
     RTP_LLM_PROFILE_FUNCTION();
     RTP_LLM_LOG_DEBUG("request [%ld] trans query", prefill_context.request_id);
     prepareGenerateInput(prefill_context);
+
+    // The P/D-disaggregated prefill entry reaches enqueue() via transQuery here, bypassing
+    // LocalRpcServer::prepareInput and its HTTP-layer capability check. A probability/logit
+    // request under a speculative engine (MTP is kept on for prefill above) would otherwise hit
+    // an undefined tensor and throw on the NormalEngine::loop dispatch thread, which is not
+    // caught. Reject it up-front as a bad-request instead.
+    if (engine_ != nullptr && prefill_context.generate_input->generate_config
+        && speculationRejectsRequest(*prefill_context.generate_input->generate_config, *engine_)) {
+        prefill_context.error_info =
+            ErrorInfo(ErrorCode::ERROR_GENERATE_CONFIG_FORMAT,
+                      "speculative decoding does not support probability or logit output");
+        prefill_context.error_status =
+            serializeErrorMsg(prefill_context.request_key, prefill_context.request_info, prefill_context.error_info);
+        logPrefillFailureTrace("get_rpc_connection_speculative_probability", prefill_context);
+        return;
+    }
 
     RTP_LLM_LOG_DEBUG("request [%ld] get rpc connection", prefill_context.request_id);
 

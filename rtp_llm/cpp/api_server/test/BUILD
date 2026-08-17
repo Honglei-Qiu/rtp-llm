@@ -107,6 +107,7 @@ cc_library(
         "InferenceDataTypeTest.cc",
         "ConcurrencyControllerTest.cc",
         "ChatServiceTest.cc",
+        "RequestCapabilityPredicateTest.cc",
         "TestMain.cc",
     ],
     deps = test_deps + [

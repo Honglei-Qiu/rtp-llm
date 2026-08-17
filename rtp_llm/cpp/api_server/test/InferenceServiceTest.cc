@@ -85,6 +85,54 @@ protected:
         parallel_info.setEpSize(1);
     }
 
+    void ExpectSpeculativeLogprobsRejected(bool is_internal) {
+        if (is_internal) {
+            SetToWorker();
+        } else {
+            SetToMaster();
+        }
+
+        auto writer = dynamic_cast<http_server::HttpResponseWriter*>(mock_writer_.get());
+        ASSERT_NE(writer, nullptr);
+        std::unique_ptr<http_server::HttpResponseWriter> writer_ptr(writer);
+
+        http_server::HttpRequest request;
+        const std::string        body = R"del({
+            "prompt": "hello",
+            "generate_config": {"return_all_probs": 1},
+            "source": "test_source"
+        })del";
+        request._request              = CreateHttpPacket(body);
+
+        inference_service_->controller_->max_concurrency_ = 0;
+        EXPECT_CALL(*mock_engine_, hasSpeculativeExecutor()).WillOnce(Return(true));
+        EXPECT_CALL(*mock_engine_, batchEnqueue(Matcher<const std::vector<std::shared_ptr<GenerateInput>>&>(_)))
+            .Times(0);
+        EXPECT_CALL(*mock_token_processor_, encode(_)).Times(0);
+        EXPECT_CALL(*mock_metric_reporter_, reportQpsMetric(_)).Times(0);
+        EXPECT_CALL(*mock_metric_reporter_, reportFTInputTokenLengthMetric(_)).Times(0);
+        EXPECT_CALL(*mock_metric_reporter_, reportFTNumBeansMetric(_)).Times(0);
+        EXPECT_CALL(*mock_metric_reporter_, reportConflictQpsMetric()).Times(0);
+        EXPECT_CALL(*mock_metric_reporter_, reportErrorQpsMetric("test_source",
+                                                                  HttpApiServerException::ERROR_INPUT_FORMAT_ERROR));
+        EXPECT_CALL(*mock_writer_, isConnected()).WillOnce(Return(true));
+        EXPECT_CALL(*mock_writer_, Write).WillOnce(Invoke([](const std::string& data) {
+            ErrorResponse error_response;
+            autil::legacy::FromJsonString(error_response, data);
+            EXPECT_EQ(error_response.error_code, HttpApiServerException::ERROR_INPUT_FORMAT_ERROR);
+            EXPECT_EQ(error_response.error_msg,
+                      "speculative decoding does not support probability or logit output");
+            return true;
+        }));
+
+        inference_service_->inference(writer_ptr, request, is_internal);
+
+        EXPECT_EQ(inference_service_->controller_->current_concurrency_, 0);
+        EXPECT_EQ(inference_service_->controller_->max_concurrency_, 0);
+        EXPECT_EQ(writer_ptr->_statusCode, HttpApiServerException::ERROR_INPUT_FORMAT_ERROR);
+        writer_ptr.release();
+    }
+
 protected:
     std::unique_ptr<http_server::MockHttpResponseWriter> mock_writer_;
     std::shared_ptr<MockEngineBase>                      mock_engine_;
@@ -153,6 +201,14 @@ TEST_F(InferenceServiceTest, Inference_IsNotInternal_IsNotMaster) {
 
     // 需要手动释放 unique_ptr 的所有权, 避免 double free
     writer_ptr.release();
+}
+
+TEST_F(InferenceServiceTest, ExternalInferenceRejectsSpeculativeLogprobsBeforeAdmission) {
+    ExpectSpeculativeLogprobsRejected(false);
+}
+
+TEST_F(InferenceServiceTest, InternalInferenceRejectsSpeculativeLogprobsBeforeAdmission) {
+    ExpectSpeculativeLogprobsRejected(true);
 }
 
 TEST_F(InferenceServiceTest, InferResponseFailed_ControllerIsNull) {

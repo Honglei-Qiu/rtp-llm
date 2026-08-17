@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
 #include "rtp_llm/cpp/model_rpc/QueryConverter.h"
+#include "rtp_llm/cpp/api_server/RequestCapabilityPredicate.h"
 #include "rtp_llm/cpp/model_rpc/proto/model_rpc_service.pb.h"
 #include "rtp_llm/cpp/config/EplbConfig.h"
 #include "rtp_llm/cpp/config/RoleTypes.h"
@@ -152,6 +153,16 @@ grpc::Status LocalRpcServer::pollStreamOutput(grpc::ServerContext*             c
 
 ErrorInfo LocalRpcServer::prepareInput(const GenerateInputPB& input_pb, std::shared_ptr<GenerateInput>& output) {
     output = QueryConverter::transQuery(&input_pb);
+    // Every gRPC entry point funnels through here, including the P/D-disaggregated path the
+    // Python OpenAI endpoint uses, none of which ran the HTTP-layer capability check. A
+    // probability request under a speculative engine would otherwise reach an undefined tensor
+    // and throw on the dispatch thread, which NormalEngine::loop does not catch. Translate to
+    // an ErrorInfo instead of throwing so nothing escapes this sync handler.
+    if (engine_ != nullptr && output->generate_config
+        && speculationRejectsRequest(*output->generate_config, *engine_)) {
+        return ErrorInfo(ErrorCode::ERROR_GENERATE_CONFIG_FORMAT,
+                         "speculative decoding does not support probability or logit output");
+    }
     if (mm_processor_ != nullptr && output->multimodal_inputs) {
         RTP_LLM_PROFILE_SCOPE("rpc.mm_update_features");
         auto mm_res = mm_processor_->updateMultimodalFeatures(output);
