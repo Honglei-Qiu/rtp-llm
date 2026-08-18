@@ -47,7 +47,9 @@ cc_test(
     srcs = glob([
         "MtpBatchStreamProcessorTest.cc",
     ]),
-    data = [],
+    data = [
+        "spec_update_prefix_dict.json",
+    ],
     copts = test_copts,
     deps = [
         "//rtp_llm/cpp/testing:device_test_utils",

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <limits>
+#include <set>
 #include "torch/all.h"
 #include "gtest/gtest.h"
 
@@ -16,6 +17,10 @@
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/models/logits_processor/LogitsProcessorStates.h"
+#include "rtp_llm/cpp/models/logits_processor/MultiSeqLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/RecommendationLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/ThinkModeLogitsProcessor.h"
+#include "rtp_llm/cpp/models/logits_processor/TreeLogitsProcessor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/testing/TestBase.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
@@ -71,6 +76,67 @@ double benchmarkUs(Func&& func, int iterations) {
     return std::chrono::duration<double, std::micro>(end - start).count() / iterations;
 }
 
+class RecordingLogitsProcessor final: public BaseLogitsProcessor {
+public:
+    std::optional<ErrorInfo> process(const SamplerInputs&, size_t, size_t) override {
+        return std::nullopt;
+    }
+
+    void updateMultiSeqStatus(const std::vector<int>&) override {}
+
+    std::optional<ErrorInfo> updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) override {
+        last_update_count      = num_new_tokens;
+        last_batch_size        = new_tokens.size(0);
+        last_tensor_width      = new_tokens.size(1);
+        last_tensor_numel      = new_tokens.numel();
+        last_tensor_contiguous = new_tokens.is_contiguous();
+        committed_count += num_new_tokens;
+        auto tokens_cpu = new_tokens.is_cuda() ? new_tokens.cpu() : new_tokens;
+        committed_tokens.assign(tokens_cpu.data_ptr<int32_t>(), tokens_cpu.data_ptr<int32_t>() + num_new_tokens);
+        return std::nullopt;
+    }
+
+    std::optional<int64_t> committedOutputLen() const override {
+        return committed_count;
+    }
+
+    int              last_update_count      = 0;
+    int64_t          last_batch_size        = 0;
+    int64_t          last_tensor_width      = 0;
+    int64_t          last_tensor_numel      = 0;
+    bool             last_tensor_contiguous = false;
+    int64_t          committed_count        = 0;
+    std::vector<int> committed_tokens;
+};
+
+class PrefixDictionaryResetGuard {
+public:
+    ~PrefixDictionaryResetGuard() {
+        // Keep the process-global factory state isolated from later stream tests.
+        PrefixToCandidateTokens::instance()->reloadPrefixDict("");
+    }
+};
+
+std::shared_ptr<TreeLogitsProcessor> makeSequenceLimitTreeProcessor(int32_t input_length) {
+    auto prefix_dictionary = PrefixToCandidateTokens::instance();
+    prefix_dictionary->reloadPrefixDict(
+        "./rtp_llm/cpp/normal_engine/speculative/test/spec_update_prefix_dict.json");
+    auto dfa = std::make_shared<TreeDFA<std::string, int>>(prefix_dictionary);
+    return std::make_shared<TreeLogitsProcessor>(
+        std::vector<StreamTreeInfo>{{true, input_length, 0, false, std::move(dfa)}});
+}
+
+std::shared_ptr<RecommendationLogitsProcessor> makeSequenceLimitRecommendationProcessor(int32_t input_length) {
+    return std::make_shared<RecommendationLogitsProcessor>(std::vector<StreamRecommendationInfo>{
+        StreamRecommendationInfo(3, input_length, 0, false, std::set<std::vector<int>>{})});
+}
+
+std::shared_ptr<ThinkModeLogitsProcessor> makeSequenceLimitThinkProcessor(int32_t input_length) {
+    auto dfa = std::make_shared<StringContainDFA<size_t, int>>(std::vector<int>{31});
+    return std::make_shared<ThinkModeLogitsProcessor>(std::vector<StreamThinkInfo>{
+        StreamThinkInfo(true, 32, {}, {31}, input_length, 0, false, std::move(dfa))});
+}
+
 class MtpBatchStreamProcessorTest: public DeviceTestBase {
 public:
     static CacheConfig makeProcessorCacheConfig() {
@@ -97,7 +163,10 @@ public:
         BatchKVCacheResource addr;
         // New (refactored) BatchKVCacheResource: [batch_id][group_id] -> block_indices
         addr.resetBatchSize(1);
-        addr.initGroups(makeProcessorCacheConfig().topologyPtr());
+        const auto topology = resource_context.cache_manager ?
+                                  resource_context.cache_manager->cacheConfig().topologyPtr() :
+                                  makeProcessorCacheConfig().topologyPtr();
+        addr.initGroups(topology);
         addr.setBatchBlocks(0, 0, {block_id});
         stream->setKVCache(addr);
 
@@ -173,6 +242,277 @@ TEST_F(MtpBatchStreamProcessorTest, DISABLED_benchmarkScoreTokenIdsTorchCopyVsMe
     std::cout << "[mtp-score-token-ids-copy] streams=" << stream_count << " score_len=" << score_len
               << " max_seq_len=" << max_seq_len << " iterations=" << iterations << " memcpy_us=" << memcpy_us
               << " torch_copy_us=" << torch_us << " speedup=" << (memcpy_us / torch_us) << std::endl;
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecUpdateAtEffectiveLimitMutatesNoOwnedState) {
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len    = 8;
+    model_config.vocab_size     = 32;
+    model_config.num_layers     = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 4, 5, 6}, 1);
+    auto sp_output = stream->getSPOutputBuffer();
+    sp_output->propose_step       = 2;
+    sp_output->tokens             = torch::tensor({4, 5}, torch::kInt32).reshape({1, 2});
+    sp_output->hidden_states      = torch::tensor({{0.1f, 0.2f}});
+    sp_output->all_probs          = torch::tensor({{0.3f, 0.7f}});
+    sp_output->propose_tokens_gpu = torch::tensor({{5}}, torch::kInt32);
+    stream->setProposeToken({4, 5});
+
+    auto processor = std::make_shared<RecordingLogitsProcessor>();
+    stream->logits_processor_list_.push_back(processor);
+
+    const auto tokens_before         = stream->getCompleteTokenIds()->completeTokenIdsVec(0);
+    const auto blocks_before         = stream->kvCache().getAllBatchBlocks(/*group_id=*/0);
+    const auto sp_tokens_before      = sp_output->tokens.clone();
+    const auto hidden_before         = sp_output->hidden_states.clone();
+    const auto probs_before          = sp_output->all_probs.clone();
+    const auto propose_gpu_before    = sp_output->propose_tokens_gpu.clone();
+    const auto propose_vector_before = stream->getProposeToken();
+
+    ASSERT_EQ(stream->maxTokenNum(), 6);
+    ASSERT_EQ(stream->seqLength(), 6);
+    stream->specUpdate({torch::tensor({{7}}, torch::kInt32),
+                        1,
+                        /*draft_token=*/8,
+                        torch::tensor({{0.4f, 0.5f}}),
+                        torch::tensor({{0.6f, 0.4f}}),
+                        torch::tensor({{8}}, torch::kInt32)});
+
+    EXPECT_TRUE(stream->hasEvent(StreamEvents::Error));
+    EXPECT_EQ(stream->statusInfo().code(), ErrorCode::LONG_PROMPT_ERROR);
+    EXPECT_TRUE(stream->isContextStream());
+    EXPECT_FALSE(stream->hasOutput());
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), tokens_before);
+    EXPECT_EQ(stream->kvCache().getAllBatchBlocks(/*group_id=*/0), blocks_before);
+    EXPECT_TRUE(torch::equal(sp_output->tokens, sp_tokens_before));
+    EXPECT_TRUE(torch::equal(sp_output->hidden_states, hidden_before));
+    EXPECT_TRUE(torch::equal(sp_output->all_probs, probs_before));
+    EXPECT_TRUE(torch::equal(sp_output->propose_tokens_gpu, propose_gpu_before));
+    EXPECT_EQ(stream->getProposeToken(), propose_vector_before);
+    EXPECT_EQ(processor->last_update_count, 0);
+    EXPECT_EQ(processor->committed_count, 0);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecUpdatePublishesOneCommittedTokenWhenOneRemains) {
+    PrefixDictionaryResetGuard prefix_dictionary_reset;
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len    = 10;
+    model_config.vocab_size     = 32;
+    model_config.num_layers     = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 4, 5, 6, 7}, 1);
+    stream->generateConfig()->is_streaming = true;
+    auto sp_output = stream->getSPOutputBuffer();
+    sp_output->propose_step = 2;
+
+    auto processor               = std::make_shared<RecordingLogitsProcessor>();
+    auto tree_processor          = makeSequenceLimitTreeProcessor(stream->inputLength());
+    auto recommendation_processor = makeSequenceLimitRecommendationProcessor(stream->inputLength());
+    auto think_processor         = makeSequenceLimitThinkProcessor(stream->inputLength());
+    auto multi_seq_processor     = std::make_shared<MultiSeqLogitsProcessor>();
+    ASSERT_TRUE(PrefixToCandidateTokens::instance()->initSuccess());
+    stream->logits_processor_list_.push_back(processor);
+    stream->logits_processor_list_.push_back(tree_processor);
+    stream->logits_processor_list_.push_back(recommendation_processor);
+    stream->logits_processor_list_.push_back(think_processor);
+    stream->logits_processor_list_.push_back(multi_seq_processor);
+
+    ASSERT_EQ(stream->maxTokenNum(), 8);
+    ASSERT_EQ(stream->seqLength(), 7);
+    stream->specUpdate({torch::tensor({{8, 9, 10}}, torch::kInt32),
+                        3,
+                        /*draft_token=*/11,
+                        torch::tensor({{0.4f, 0.5f}}),
+                        torch::tensor({{0.6f, 0.4f}}),
+                        torch::tensor({{11}}, torch::kInt32)});
+
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8}));
+    EXPECT_EQ(processor->last_update_count, 1);
+    // Exact width plus contiguity satisfies the shared incremental layout:
+    // Tree requires equality, Grammar requires a contiguous prefix, Think
+    // consumes the prefix, Recommendation uses width to distinguish full
+    // position input, and MultiSeq must observe the same batch shape.
+    EXPECT_EQ(processor->last_batch_size, 1);
+    EXPECT_EQ(processor->last_tensor_width, 1);
+    EXPECT_EQ(processor->last_tensor_numel, 1);
+    EXPECT_TRUE(processor->last_tensor_contiguous);
+    EXPECT_EQ(processor->committed_tokens, (std::vector<int>{8}));
+    EXPECT_EQ(tree_processor->getStatus(), (std::vector<std::string>{"1_8"}));
+    ASSERT_EQ(recommendation_processor->infos().size(), 1);
+    EXPECT_EQ(recommendation_processor->infos()[0].current_prefix, (std::vector<int>{8}));
+    EXPECT_EQ(recommendation_processor->infos()[0].current_output_length, 1);
+    EXPECT_EQ(think_processor->committedOutputLen(), std::optional<int64_t>(1));
+    EXPECT_EQ(toVec<int>(sp_output->tokens), (std::vector<int>{8, -1}));
+    EXPECT_EQ(stream->getProposeToken(), (std::vector<int>{8, -1}));
+
+    // GenerateDone is published before moveToNext commits FINISHED. A worker
+    // queued against the preceding RUNNING epoch must not replace the final
+    // output with LONG_PROMPT_ERROR or advance any owner a second time.
+    ASSERT_EQ(stream->getStatus(), StreamState::RUNNING);
+    ASSERT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    ASSERT_FALSE(stream->hasEvent(StreamEvents::Error));
+    ASSERT_TRUE(stream->hasOutput());
+    const auto tokens_before_stale_update         = stream->getCompleteTokenIds()->completeTokenIdsVec(0);
+    const auto sp_tokens_before_stale_update      = sp_output->tokens.clone();
+    const auto propose_before_stale_update        = stream->getProposeToken();
+    const auto tree_before_stale_update           = tree_processor->getStatus();
+    const auto recommendation_before_stale_update = recommendation_processor->infos()[0];
+    stream->specUpdate({torch::tensor({{11}}, torch::kInt32),
+                        1,
+                        /*draft_token=*/12,
+                        torch::tensor({{0.1f, 0.2f}}),
+                        torch::tensor({{0.2f, 0.8f}}),
+                        torch::tensor({{12}}, torch::kInt32),
+                        /*update_remote_generate=*/true,
+                        /*force_update_info=*/false,
+                        /*error_info=*/ErrorInfo(ErrorCode::UNKNOWN_ERROR, "stale worker error")});
+
+    EXPECT_TRUE(stream->statusInfo().ok());
+    EXPECT_EQ(stream->getStatus(), StreamState::RUNNING);
+    EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    EXPECT_FALSE(stream->hasEvent(StreamEvents::Error));
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), tokens_before_stale_update);
+    EXPECT_TRUE(torch::equal(sp_output->tokens, sp_tokens_before_stale_update));
+    EXPECT_EQ(stream->getProposeToken(), propose_before_stale_update);
+    EXPECT_EQ(processor->committed_count, 1);
+    EXPECT_EQ(tree_processor->getStatus(), tree_before_stale_update);
+    EXPECT_EQ(recommendation_processor->infos()[0].current_prefix,
+              recommendation_before_stale_update.current_prefix);
+    EXPECT_EQ(recommendation_processor->infos()[0].current_output_length,
+              recommendation_before_stale_update.current_output_length);
+    EXPECT_EQ(think_processor->committedOutputLen(), std::optional<int64_t>(1));
+    EXPECT_TRUE(stream->hasOutput());
+
+    auto output = stream->nextOutput(1);
+    ASSERT_TRUE(output.ok());
+    ASSERT_EQ(output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(toVec<int>(output.value().generate_outputs[0].output_ids), (std::vector<int>{8}));
+    EXPECT_TRUE(output.value().generate_outputs[0].finished);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecUpdatePendingTerminalHonorsForcedUpdate) {
+    ModelConfig     model_config;
+    RuntimeConfig   runtime_config;
+    ResourceContext resource_context;
+
+    model_config.max_seq_len = 10;
+    model_config.vocab_size  = 32;
+    model_config.num_layers  = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 4, 5, 6}, 1);
+    stream->generateConfig()->is_streaming = true;
+    stream->getSPOutputBuffer()->propose_step = 2;
+    auto processor = std::make_shared<RecordingLogitsProcessor>();
+    stream->logits_processor_list_.push_back(processor);
+
+    stream->reportEvent(StreamEvents::GenerateDone);
+    ASSERT_EQ(stream->getStatus(), StreamState::RUNNING);
+    ASSERT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    stream->specUpdate({torch::tensor({{7}}, torch::kInt32),
+                        1,
+                        /*draft_token=*/8,
+                        torch::tensor({{0.1f, 0.2f}}),
+                        torch::tensor({{0.2f, 0.8f}}),
+                        torch::tensor({{8}}, torch::kInt32),
+                        /*update_remote_generate=*/true,
+                        /*force_update_info=*/true});
+
+    EXPECT_TRUE(stream->statusInfo().ok());
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0),
+              (std::vector<int>{1, 2, 3, 4, 5, 6, 7}));
+    EXPECT_EQ(processor->committed_tokens, (std::vector<int>{7}));
+    EXPECT_EQ(processor->last_tensor_width, 1);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecUpdatePublishesOnlyCommittedPrefixAtEffectiveLimit) {
+    PrefixDictionaryResetGuard prefix_dictionary_reset;
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    auto          kv_cache_config = test::makeSimpleLinearCacheConfig(/*layer_num=*/1,
+                                                             /*block_num=*/10,
+                                                             /*tokens_per_block=*/4,
+                                                             rtp_llm::TYPE_INT8,
+                                                             /*local_head_num_kv=*/128,
+                                                             /*size_per_head=*/256);
+    ResourceContext resource_context;
+    resource_context.cache_manager = std::make_shared<KVCacheManager>(kv_cache_config);
+
+    model_config.max_seq_len    = 10;
+    model_config.vocab_size     = 32;
+    model_config.num_layers     = 1;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1, 2, 3, 4, 5, 6}, 1);
+    BatchKVCacheResource linear_blocks;
+    linear_blocks.resetBatchSize(1);
+    linear_blocks.initGroups(kv_cache_config.topologyPtr());
+    linear_blocks.setBatchBlocks(/*batch_id=*/0, /*group_id=*/0, {1, 2, 3, 4});
+    stream->setKVCache(linear_blocks);
+    stream->generateConfig()->is_streaming = true;
+    auto sp_output = stream->getSPOutputBuffer();
+    sp_output->propose_step       = 2;
+    sp_output->tokens             = torch::tensor({4, 5}, torch::kInt32).reshape({1, 2});
+    sp_output->hidden_states      = torch::tensor({{0.1f, 0.2f}});
+    sp_output->all_probs          = torch::tensor({{0.3f, 0.7f}});
+    sp_output->propose_tokens_gpu = torch::tensor({{5}}, torch::kInt32);
+
+    auto processor               = std::make_shared<RecordingLogitsProcessor>();
+    auto tree_processor          = makeSequenceLimitTreeProcessor(stream->inputLength());
+    auto recommendation_processor = makeSequenceLimitRecommendationProcessor(stream->inputLength());
+    auto think_processor         = makeSequenceLimitThinkProcessor(stream->inputLength());
+    auto multi_seq_processor     = std::make_shared<MultiSeqLogitsProcessor>();
+    ASSERT_TRUE(PrefixToCandidateTokens::instance()->initSuccess());
+    stream->logits_processor_list_.push_back(processor);
+    stream->logits_processor_list_.push_back(tree_processor);
+    stream->logits_processor_list_.push_back(recommendation_processor);
+    stream->logits_processor_list_.push_back(think_processor);
+    stream->logits_processor_list_.push_back(multi_seq_processor);
+    const auto blocks_before = stream->kvCache().getAllBatchBlocks(/*group_id=*/0);
+    ASSERT_EQ(blocks_before, (std::vector<BlockIndicesType>{{1, 2, 3, 4}}));
+
+    ASSERT_EQ(stream->maxTokenNum(), 8);
+    ASSERT_EQ(stream->seqLength(), 6);
+    stream->specUpdate({torch::tensor({{7, 8, 9}}, torch::kInt32),
+                        3,
+                        /*draft_token=*/10,
+                        torch::tensor({{0.4f, 0.5f}}),
+                        torch::tensor({{0.6f, 0.4f}}),
+                        torch::tensor({{10}}, torch::kInt32)});
+
+    EXPECT_TRUE(stream->statusInfo().ok());
+    EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8}));
+    EXPECT_EQ(stream->kvCache().getAllBatchBlocks(/*group_id=*/0),
+              (std::vector<BlockIndicesType>{{1, 3, 2, 4}}));
+    EXPECT_EQ(processor->last_update_count, 2);
+    EXPECT_EQ(processor->last_batch_size, 1);
+    EXPECT_EQ(processor->last_tensor_width, 2);
+    EXPECT_EQ(processor->last_tensor_numel, 2);
+    EXPECT_TRUE(processor->last_tensor_contiguous);
+    EXPECT_EQ(processor->committed_count, 2);
+    EXPECT_EQ(processor->committed_tokens, (std::vector<int>{7, 8}));
+    EXPECT_EQ(tree_processor->getStatus(), (std::vector<std::string>{"1_7_8"}));
+    ASSERT_EQ(recommendation_processor->infos().size(), 1);
+    EXPECT_EQ(recommendation_processor->infos()[0].current_prefix, (std::vector<int>{7, 8}));
+    EXPECT_EQ(recommendation_processor->infos()[0].current_output_length, 2);
+    EXPECT_EQ(think_processor->committedOutputLen(), std::optional<int64_t>(2));
+    EXPECT_EQ(toVec<int>(sp_output->tokens), (std::vector<int>{8, -1}));
+    EXPECT_EQ(stream->getProposeToken(), (std::vector<int>{8, -1}));
+    EXPECT_FALSE(sp_output->hidden_states.defined());
+    EXPECT_FALSE(sp_output->all_probs.defined());
+    EXPECT_FALSE(sp_output->propose_tokens_gpu.defined());
+
+    auto output = stream->nextOutput(1);
+    ASSERT_TRUE(output.ok());
+    ASSERT_EQ(output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(toVec<int>(output.value().generate_outputs[0].output_ids), (std::vector<int>{7, 8}));
+    EXPECT_TRUE(output.value().generate_outputs[0].finished);
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputReplicatesScoreTokenIds) {

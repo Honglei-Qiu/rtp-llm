@@ -96,3 +96,13 @@ cc_test(
     },
     exec_properties = {'gpu':'H20'},
 )
+
+cc_test(
+    name = "speculative_sequence_limit_test",
+    srcs = ["SpeculativeSequenceLimitTest.cc"],
+    deps = [
+        "//rtp_llm/cpp/engine_base/stream:speculative_sequence_limit",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

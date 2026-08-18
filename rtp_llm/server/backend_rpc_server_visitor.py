@@ -13,7 +13,12 @@ from rtp_llm.config.model_config import ModelConfig as PyModelConfig
 from rtp_llm.cpp.model_rpc.model_rpc_client import ModelRpcClient, trans_input
 from rtp_llm.metrics import kmonitor
 from rtp_llm.metrics.kmonitor_metric_reporter import AccMetrics, GaugeMetrics
-from rtp_llm.ops import SpeculativeExecutionConfig, VitSeparation, get_block_cache_keys
+from rtp_llm.ops import (
+    SpeculativeExecutionConfig,
+    SpeculativeType,
+    VitSeparation,
+    get_block_cache_keys,
+)
 from rtp_llm.server.cache_key_routing import route_cache_keys_for_page_rr
 from rtp_llm.server.host_service import HostService, HostServiceArgs
 from rtp_llm.server.master_client import FlexlbResponse, MasterClient
@@ -429,9 +434,7 @@ class BackendRPCServerVisitor:
             raise route_error
 
     def check_sp_supported(self, input: GenerateInput):
-        if not self.sp_config or not self.sp_config.model_type:
-            return
-        if input.generate_config.force_disable_sp_run:
+        if not self._speculative_decoding_enabled():
             return
 
         # speculative decoding does not support batched input
@@ -472,6 +475,23 @@ class BackendRPCServerVisitor:
                 + ", ".join(unsupported),
             )
 
+    def _speculative_decoding_enabled(self) -> bool:
+        sp_config = getattr(self, "sp_config", None)
+        return (
+            sp_config is not None
+            and sp_config.type != SpeculativeType.NONE
+        )
+
+    def _speculative_reserved_tokens(self) -> int:
+        if not self._speculative_decoding_enabled():
+            return 0
+        propose_step = int(self.sp_config.gen_num_per_cycle)
+        # Match the C++ readers (MtpExecutor, MtpBatchStreamProcessor, DecodeRpcServer,
+        # cuda_graph_runner), which enable the async pipeline only on the exact string "1".
+        # Accepting "true"/"yes" here would reserve for an async pipeline C++ left off.
+        stream_async = os.environ.get("RTP_LLM_STREAM_ASYNC", "") == "1"
+        return propose_step * 2 + 1 if stream_async else propose_step
+
     def fill_request_info(self, input: GenerateInput) -> None:
         if getattr(input, "request_info", None) is None:
             input.request_info = RequestInfo()
@@ -510,14 +530,18 @@ class BackendRPCServerVisitor:
                 ExceptionType.LONG_PROMPT_ERROR,
                 f"model tokens can not be empty, request length is {input.prompt_length}",
             )
+        speculative_reserved_tokens = self._speculative_reserved_tokens()
+        effective_max_seq_len = self.max_seq_len - speculative_reserved_tokens
         max_new_tokens = min(
-            self.max_seq_len - input.prompt_length,
+            effective_max_seq_len - input.prompt_length,
             input.generate_config.max_new_tokens,
         )
         if max_new_tokens <= 0:
             raise FtRuntimeException(
                 ExceptionType.LONG_PROMPT_ERROR,
                 f"model max tokens is {self.max_seq_len}, "
+                f"speculative reserved tokens is {speculative_reserved_tokens}, "
+                f"effective max tokens is {effective_max_seq_len}, "
                 f"request length is {input.prompt_length}, max_new_tokens is {max_new_tokens}",
             )
 

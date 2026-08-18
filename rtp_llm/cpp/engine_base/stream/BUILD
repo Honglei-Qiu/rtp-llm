@@ -41,10 +41,20 @@ cc_library(
 )
 
 cc_library(
+    name = "speculative_sequence_limit",
+    hdrs = ["SpeculativeSequenceLimit.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "stream",
     hdrs = glob([
         "*.h",
-    ], exclude = ["GenerateTypes.h", "CompleteTokenIds.h"]),
+    ], exclude = [
+        "CompleteTokenIds.h",
+        "GenerateTypes.h",
+        "SpeculativeSequenceLimit.h",
+    ]),
     srcs = glob([
         "*.cc",
     ], exclude = ["CompleteTokenIds.cc"]),
@@ -52,6 +62,7 @@ cc_library(
         ":generate_types",
         ":generate_config",
         ":complete_token_ids",
+        ":speculative_sequence_limit",
         "//rtp_llm/cpp/engine_base/system_prompt:system_prompt",
         "//rtp_llm/cpp/models:models",
         "//rtp_llm/cpp/models:logits_processor",

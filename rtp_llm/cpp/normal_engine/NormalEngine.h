@@ -84,6 +84,10 @@ private:
     kmonitor::MetricsReporterPtr                  metrics_reporter_;
     std::unique_ptr<ProposeModelEngineInitParams> propose_params_;
     StepWindowProfiler                            step_profiler_;
+    // Token reservation for a speculative burst, i.e. speculativeReservedTokenCount() (or
+    // propose_step + 1 when that is stricter). It is NOT propose_step + 1 by definition, so it
+    // must never be inverted to recover propose_step: under the async pipeline it is 2*step+1,
+    // and reserve_step_ - 1 would yield 2*step and reserve twice too much.
     int                                           reserve_step_ = 0;
 };
 

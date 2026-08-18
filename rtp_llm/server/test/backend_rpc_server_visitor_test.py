@@ -1,6 +1,9 @@
 import unittest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import torch
 
 from rtp_llm.config.exceptions import (
     AdmissionRejectReason,
@@ -8,6 +11,7 @@ from rtp_llm.config.exceptions import (
     FtRuntimeException,
 )
 from rtp_llm.config.generate_config import RoleAddr, RoleType
+from rtp_llm.ops import SpeculativeType
 from rtp_llm.server.backend_rpc_server_visitor import (
     BackendRPCServerVisitor,
     get_role_names,
@@ -167,6 +171,92 @@ class BackendRPCServerVisitorRouteCacheKeysTest(unittest.TestCase):
 
         visitor._page_rr_route_cache_keys = True
         self.assertEqual(visitor._cache_key_block_size(), 1024)
+
+
+class BackendRPCServerVisitorSpeculativeLimitTest(unittest.TestCase):
+    def _visitor(self, sp_type=SpeculativeType.MTP, propose_step=3):
+        visitor = BackendRPCServerVisitor.__new__(BackendRPCServerVisitor)
+        visitor.max_seq_len = 10
+        visitor.sp_config = SimpleNamespace(
+            type=sp_type,
+            gen_num_per_cycle=propose_step,
+            model_type="",
+        )
+        return visitor
+
+    def _input(self, prompt_length, *, force_disable=False, batch_size=1):
+        return SimpleNamespace(
+            prompt_length=prompt_length,
+            token_ids=torch.zeros((batch_size, prompt_length), dtype=torch.int32),
+            generate_config=SimpleNamespace(
+                max_new_tokens=1,
+                force_disable_sp_run=force_disable,
+                num_return_sequences=1,
+                num_beams=1,
+                return_all_probs=False,
+            ),
+        )
+
+    def _assert_long_prompt(self, visitor, prompt_length):
+        with self.assertRaises(FtRuntimeException) as context:
+            visitor._validate_input(self._input(prompt_length))
+        self.assertEqual(
+            context.exception.exception_type,
+            ExceptionType.LONG_PROMPT_ERROR,
+        )
+        return context.exception.message
+
+    def test_sync_reserve_uses_active_type_not_model_name(self):
+        with patch.dict("os.environ", {"RTP_LLM_STREAM_ASYNC": "0"}):
+            for sp_type in (SpeculativeType.MTP, SpeculativeType.EAGLE):
+                visitor = self._visitor(sp_type=sp_type)
+                visitor._validate_input(self._input(6))
+                message = self._assert_long_prompt(visitor, 7)
+                self.assertIn("speculative reserved tokens is 3", message)
+                self.assertIn("effective max tokens is 7", message)
+
+    def test_async_reserve_matches_runtime_two_windows_plus_one(self):
+        visitor = self._visitor()
+        with patch.dict("os.environ", {"RTP_LLM_STREAM_ASYNC": "1"}):
+            visitor._validate_input(self._input(2))
+            message = self._assert_long_prompt(visitor, 3)
+        self.assertIn("speculative reserved tokens is 7", message)
+        self.assertIn("effective max tokens is 3", message)
+
+    def test_only_exact_one_enables_async_reserve(self):
+        # The runtime readers (MtpExecutor, MtpBatchStreamProcessor, DecodeRpcServer,
+        # cuda_graph_runner, GenerateStream) all enable the async pipeline only on the
+        # exact string "1". Reserving 2*step+1 for any other spelling would drop this
+        # limit below the one admission approved, for a pipeline that stays off.
+        for value in ("true", "True", "TRUE", "yes", "on", "2", "0", ""):
+            with self.subTest(value=value):
+                visitor = self._visitor()
+                with patch.dict("os.environ", {"RTP_LLM_STREAM_ASYNC": value}):
+                    visitor._validate_input(self._input(6))
+                    message = self._assert_long_prompt(visitor, 7)
+                self.assertIn("speculative reserved tokens is 3", message)
+                self.assertIn("effective max tokens is 7", message)
+
+    def test_none_and_missing_config_use_full_model_limit(self):
+        visitor = self._visitor(sp_type=SpeculativeType.NONE)
+        visitor.sp_config.model_type = "misleading-model-name"
+        visitor._validate_input(self._input(9))
+        self._assert_long_prompt(visitor, 10)
+
+        visitor.sp_config = None
+        visitor._validate_input(self._input(9))
+        self._assert_long_prompt(visitor, 10)
+
+    def test_force_disable_cannot_bypass_active_backend_executor(self):
+        visitor = self._visitor()
+        with self.assertRaises(FtRuntimeException) as context:
+            visitor.check_sp_supported(
+                self._input(2, force_disable=True, batch_size=2)
+            )
+        self.assertEqual(
+            context.exception.exception_type,
+            ExceptionType.UNSUPPORTED_OPERATION,
+        )
 
 
 class BackendRPCServerVisitorRouteIpsTest(unittest.IsolatedAsyncioTestCase):

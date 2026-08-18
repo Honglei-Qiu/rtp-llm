@@ -9,6 +9,7 @@
 #endif
 #include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
+#include "rtp_llm/cpp/engine_base/stream/SpeculativeSequenceLimit.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -46,7 +47,7 @@ std::optional<std::string> validateOutputVocabRequest(GenerateConfig& config, si
 }
 
 bool useStreamAsyncReserveTokens() {
-    static const bool enabled = autil::EnvUtil::getEnv("RTP_LLM_STREAM_ASYNC", false);
+    static const bool enabled = speculativeStreamAsyncEnabled();
     return enabled;
 }
 
@@ -861,16 +862,17 @@ size_t GenerateStream::curBlocksNum() const {
 }
 
 size_t GenerateStream::maxTokenNum() const {
-    int reserve_tokens = 0;
+    size_t reserve_tokens = 0;
     if (sp_output_buffer_) {
-        reserve_tokens = sp_output_buffer_->propose_step;
-        if (useStreamAsyncReserveTokens()) {
-            reserve_tokens = reserve_tokens * 2 + 1;
-        }
+        reserve_tokens =
+            speculativeReservedTokenCount(sp_output_buffer_->propose_step, useStreamAsyncReserveTokens());
     }
 
-    return std::min(max_seq_len_ > reserve_tokens ? max_seq_len_ - reserve_tokens : 0,
-                    generate_input_->generate_config->max_new_tokens + generate_input_->inputLength());
+    const size_t max_seq_len    = static_cast<size_t>(max_seq_len_);
+    const size_t effective_limit = max_seq_len > reserve_tokens ? max_seq_len - reserve_tokens : 0;
+    const size_t requested_limit = static_cast<size_t>(generate_input_->generate_config->max_new_tokens)
+                                   + static_cast<size_t>(generate_input_->inputLength());
+    return std::min(effective_limit, requested_limit);
 }
 
 bool GenerateStream::needFinish() {
@@ -942,39 +944,62 @@ void GenerateStream::matchStopWordsList(int batch_id) {
 
 void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     // Worker-thread MTP bookkeeping updates tokens/output and finish checks
-    // before the next async dispatch. The speculative propose_step+1 window
-    // already covers stop/EOS/max-token boundaries.
+    // before the next async dispatch. One committed prefix must drive every
+    // state consumer when an accepted burst reaches the effective limit.
     RTP_LLM_PROFILE_FUNCTION();
     std::lock_guard<std::mutex> lock(*mutex_);
     RTP_LLM_LOG_DEBUG("stream [%s] spec update", streamLogTag().c_str());
-    *is_context_stream_ = false;
+    // A terminal event is visible to consumers before the scheduler commits
+    // FINISHED. Ignore workers queued against the preceding RUNNING epoch, but
+    // preserve the explicit force-update escape hatch.
+    if (generate_status_->checkFinished() && !update_info.force_update_info) {
+        return;
+    }
     if (reportUpdateErrorWithoutLock(update_info.error_info)) {
-        return;
-    }
-    if ((hasErrorWithoutLock() || isFinished()) && !update_info.force_update_info) {
-        return;
-    }
-    // Ignore stale worker updates after finish; committing them would duplicate
-    // tokens and touch KV blocks only deferred until this worker exits.
-    if (isFinished() && !update_info.force_update_info) {
         return;
     }
 
     const auto& new_tokens = update_info.new_tokens;
 
-    if (isPerfTest()) {
-        const_cast<torch::Tensor&>(new_tokens).zero_();
+    RTP_LLM_CHECK(new_tokens.dim() == 2);
+    RTP_LLM_CHECK(new_tokens.size(0) == currentBatchSize());
+    RTP_LLM_CHECK(update_info.num_new_tokens > 0);
+    RTP_LLM_CHECK(update_info.num_new_tokens <= new_tokens.size(1));
+
+    const int    previous_seq_len     = seqLength();
+    const size_t effective_max_tokens = maxTokenNum();
+    const int    committed_count      = committedSpeculativeTokenCount(
+        previous_seq_len, effective_max_tokens, update_info.num_new_tokens);
+    if (committed_count == 0) {
+        reportEventWithoutLock(
+            StreamEvents::Error,
+            ErrorCode::LONG_PROMPT_ERROR,
+            "stream [" + std::to_string(streamId()) + "] cannot accept speculative tokens at sequence length ["
+                + std::to_string(previous_seq_len) + "], effective max tokens is ["
+                + std::to_string(effective_max_tokens) + "]");
+        return;
     }
 
-    auto num_new_tokens = update_info.num_new_tokens;
-    int  cur_cached_len = seqLength() - 1;
+    const bool truncated = committed_count < update_info.num_new_tokens;
+    // A truncated terminal burst must not retain the wider accepted-token
+    // layout. Tree and recommendation processors attach semantic meaning to
+    // tensor width, so every consumer receives the same owning prefix tensor.
+    auto committed_tokens = truncated ? new_tokens.narrow(1, 0, committed_count).clone() : new_tokens;
+
+    *is_context_stream_ = false;
+
+    if (isPerfTest()) {
+        committed_tokens.zero_();
+    }
+
+    const int  cur_cached_len = previous_seq_len - 1;
 
     int error_token_id = 0;
-    if (!complete_token_ids_->update(new_tokens,
+    if (!complete_token_ids_->update(committed_tokens,
                                      begin_time_us_,
-                                     num_new_tokens,
+                                     committed_count,
                                      generate_input_->inputLength(),
-                                     maxTokenNum(),
+                                     static_cast<int>(effective_max_tokens),
                                      vocab_size_,
                                      hasNumBeams(),
                                      streamId(),
@@ -986,39 +1011,49 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
         return;
     }
 
-    int nxt_cached_len   = seqLength() - 1;
-    int accept_token_num = nxt_cached_len - cur_cached_len;
+    const int nxt_cached_len   = seqLength() - 1;
+    const int accept_token_num = nxt_cached_len - cur_cached_len;
+    RTP_LLM_CHECK(accept_token_num == committed_count);
 
     // The stream token history is authoritative. Advance every processor exactly
     // once before mutating speculative buffers, cache layout or published output.
-    if (auto error = updateLogitProcessorStatus(new_tokens, accept_token_num); error.has_value()) {
+    if (auto error = updateLogitProcessorStatus(committed_tokens, accept_token_num); error.has_value()) {
         reportEventWithoutLock(StreamEvents::Error, error->code(), error->ToString());
         return;
     }
 
     // update speculative output buffer
-    int  target_last_token = new_tokens.data_ptr<int>()[num_new_tokens - 1];
+    int  target_last_token = committed_tokens.data_ptr<int>()[committed_count - 1];
     int* spec_tokens       = sp_output_buffer_->tokens.data_ptr<int>();
     spec_tokens[0]         = target_last_token;
-    if (update_info.draft_token >= 0) {
-        RTP_LLM_CHECK_WITH_INFO(sp_output_buffer_->tokens.numel() >= 2,
-                                "speculative token buffer must contain target and draft slots");
-        spec_tokens[1]  = update_info.draft_token;
-        propose_token_ = {target_last_token, update_info.draft_token};
+    if (truncated) {
+        // E11: the accepted burst reached the effective limit. This is terminal, so publish
+        // only the last committed target token and make the invalid next draft unobservable.
+        spec_tokens[1]                        = -1;
+        propose_token_                        = {target_last_token, -1};
+        sp_output_buffer_->hidden_states      = torch::Tensor();
+        sp_output_buffer_->all_probs          = torch::Tensor();
+        sp_output_buffer_->propose_tokens_gpu = torch::Tensor();
     } else {
-        // Commit-only speculative steps (DSpARK prefill/decode tail) publish
-        // only accepted target tokens. Their next proposal is produced at the
-        // following decode round head and must not become persistent stream
-        // or PD side-channel state.
-        propose_token_.clear();
-    }
+        if (update_info.draft_token >= 0) {
+            RTP_LLM_CHECK_WITH_INFO(sp_output_buffer_->tokens.numel() >= 2,
+                                    "speculative token buffer must contain target and draft slots");
+            spec_tokens[1] = update_info.draft_token;
+            propose_token_ = {target_last_token, update_info.draft_token};
+        } else {
+            // Commit-only speculative steps (DSpARK prefill/decode tail) publish only accepted
+            // target tokens. Their next proposal is produced at the following decode round head
+            // and must not become persistent stream or PD side-channel state.
+            propose_token_.clear();
+        }
 
-    sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
-    sp_output_buffer_->all_probs     = update_info.draft_token_probs;
-    // Cache the per-stream GPU propose tokens for the next decode step.
-    // PDFUSION path provides this; PD-disaggregate path leaves it undefined and
-    // readers fall back to the CPU `tokens` tensor.
-    sp_output_buffer_->propose_tokens_gpu = update_info.draft_token_gpu;
+        sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
+        sp_output_buffer_->all_probs     = update_info.draft_token_probs;
+        // Cache the per-stream GPU propose tokens for the next decode step.
+        // PDFUSION path provides this; PD-disaggregate path leaves it undefined and
+        // readers fall back to the CPU `tokens` tensor.
+        sp_output_buffer_->propose_tokens_gpu = update_info.draft_token_gpu;
+    }
 
     // for spec-decode linear attention, we need to adjust cache blocks
     if (accept_token_num > 1 && stream_cache_resource_) {
@@ -1050,8 +1085,8 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
     }
 
     // update normal output buffer
-    updateOutput({new_tokens,
-                  num_new_tokens,
+    updateOutput({committed_tokens,
+                  committed_count,
                   torch::Tensor(),
                   torch::Tensor(),
                   torch::Tensor(),

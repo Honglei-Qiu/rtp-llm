@@ -24,6 +24,17 @@ py_test(
 )
 
 py_test(
+    name = "backend_rpc_server_visitor_test",
+    srcs = ["backend_rpc_server_visitor_test.py"],
+    deps = [
+        "//rtp_llm:testlib",
+        "//rtp_llm/server:server",
+        "//rtp_llm:config_ops",
+    ],
+    timeout = "short",
+)
+
+py_test(
     name = "schedule_meta_test",
     srcs = ["schedule_meta_test.py"],
     deps = [

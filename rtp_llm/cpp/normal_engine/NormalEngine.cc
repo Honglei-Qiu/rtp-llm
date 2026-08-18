@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
+#include "rtp_llm/cpp/engine_base/stream/SpeculativeSequenceLimit.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
@@ -131,7 +132,14 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
                                 "output_vocab_padded_size must be >= output_vocab_ids.size()");
     }
     if (propose_params_) {
-        reserve_step_ = propose_params_->gen_num_per_circle + 1;
+        // Admission (FIFOSchedulerBase::checkInputLength via reserveStep()) and the per-stream
+        // limit (GenerateStream::maxTokenNum) must not disagree: if admission were the laxer of
+        // the two, a prompt could pass admission and then immediately exceed the limit, failing
+        // the request after zero tokens. Keep the historical step + 1 for the sync pipeline and
+        // take whichever is stricter.
+        const size_t propose_step = static_cast<size_t>(propose_params_->gen_num_per_circle);
+        reserve_step_             = static_cast<int>(std::max(
+            propose_step + 1, speculativeReservedTokenCount(propose_step, speculativeStreamAsyncEnabled())));
     } else {
         reserve_step_ = 0;
     }
