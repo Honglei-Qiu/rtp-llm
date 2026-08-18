@@ -134,6 +134,20 @@ py_test(
 )
 
 py_test(
+    name = "openai_choice_index_test",
+    srcs = [
+        "openai_choice_index_test.py",
+    ],
+    data = [
+        "//rtp_llm:openai/api_datatype.py",
+        "//rtp_llm:openai/openai_endpoint.py",
+    ],
+    deps = [
+        "//rtp_llm:pydantic",
+    ],
+)
+
+py_test(
     name = "server_test",
     srcs = [
         "server_test.py",
