@@ -424,3 +424,14 @@ py_test(
     ],
     exec_properties = {'gpu':'H20'},
 )
+
+py_test(
+    name = "openai_render_input_error_test",
+    srcs = [
+        "openai_render_input_error_test.py",
+    ],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    exec_properties = {'gpu':'H20'},
+)

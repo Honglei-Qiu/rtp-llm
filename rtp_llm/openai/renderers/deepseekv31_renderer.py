@@ -1,7 +1,7 @@
 import logging
 from typing import Optional
 
-from jinja2 import BaseLoader, Environment
+from jinja2 import BaseLoader, Environment, TemplateError
 from transformers import PreTrainedTokenizerBase
 from typing_extensions import override
 
@@ -168,9 +168,12 @@ class DeepseekV31Renderer(ReasoningToolBaseRenderer):
             template = env.from_string(self.chat_template)
             rendered_prompt = template.render(**context)
             return rendered_prompt
-        except Exception as e:
+        except (TemplateError, ValueError) as e:
+            # Only a template rejecting the conversation is the caller's fault. Catching every
+            # exception here relabelled our own bugs, tokenizer failures included, as malformed
+            # input, and dropped the cause on the way out.
             logging.error(f"构建提示文本失败: {str(e)}")
-            raise ValueError(f"Error rendering prompt template: {str(e)}")
+            raise ValueError(f"Error rendering prompt template: {str(e)}") from e
 
     @override
     def _create_detector(

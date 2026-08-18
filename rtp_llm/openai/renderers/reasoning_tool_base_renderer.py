@@ -5,7 +5,7 @@ import os
 from abc import ABC
 from typing import List, Optional, Tuple
 
-from jinja2 import BaseLoader, Environment
+from jinja2 import BaseLoader, Environment, TemplateError
 from typing_extensions import override
 
 from rtp_llm.frontend.tokenizer_factory.tokenizers import BaseTokenizer
@@ -177,9 +177,11 @@ class ReasoningToolBaseRenderer(CustomChatRenderer, ABC):
             template = env.from_string(self.chat_template)
             rendered_prompt = template.render(**context)
             return rendered_prompt
-        except Exception as e:
+        except (TemplateError, ValueError) as e:
+            # See deepseekv31_renderer: a blanket catch here reported our own failures as the
+            # caller's malformed input and discarded the cause.
             logging.error(f"构建提示文本失败: {str(e)}")
-            raise ValueError(f"Error rendering prompt template: {str(e)}")
+            raise ValueError(f"Error rendering prompt template: {str(e)}") from e
 
     def _preprocess_messages(self, messages: List[dict]) -> List[dict]:
         """

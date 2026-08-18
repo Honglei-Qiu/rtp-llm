@@ -20,6 +20,7 @@ from rtp_llm.openai.renderers.sglang_helpers.function_call.deepseekv32_detector 
     DeepSeekV32Detector,
 )
 from rtp_llm.openai.renderers.sglang_helpers.reasoning_parser import ReasoningParser
+from jinja2 import TemplateError
 
 
 class DeepseekV32Renderer(ReasoningToolBaseRenderer):
@@ -234,9 +235,11 @@ class DeepseekV32Renderer(ReasoningToolBaseRenderer):
             )
 
             return rendered_prompt
-        except Exception as e:
+        except (TemplateError, ValueError) as e:
+            # See deepseekv31_renderer: a blanket catch here reported our own failures as the
+            # caller's malformed input and discarded the cause.
             logging.error(f"Failed to render DeepSeek V3.2 prompt: {str(e)}")
-            raise ValueError(f"Error rendering DeepSeek V3.2 prompt: {str(e)}")
+            raise ValueError(f"Error rendering DeepSeek V3.2 prompt: {str(e)}") from e
 
     @override
     def _create_detector(

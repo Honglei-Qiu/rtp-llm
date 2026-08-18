@@ -76,9 +76,16 @@ class CommonInputGenerator(object):
                 input_lengths = torch.from_numpy(encoded["length"]).to(torch.int32)
             elif isinstance(prompt, list) and isinstance(prompt[0], ChatMessage):
                 chat_request = ChatCompletionRequest(messages=prompt)
-                rendered_input = self.openai_render_info.chat_renderer.render_chat(
-                    chat_request
-                )
+                try:
+                    rendered_input = (
+                        self.openai_render_info.chat_renderer.render_chat(chat_request)
+                    )
+                except ValueError as e:
+                    # Same class of caller mistake as the unsupported-prompt-type branch
+                    # below, so it must not leave here untyped as a server fault.
+                    raise FtRuntimeException(
+                        ExceptionType.ERROR_INPUT_FORMAT_ERROR, str(e)
+                    ) from e
                 encoded = rendered_input.input_ids
                 combo_tokens = torch.from_numpy(np.array(encoded)).to(torch.int32)
                 input_lengths = torch.from_numpy(np.array([len(encoded)])).to(

@@ -5,6 +5,7 @@ from functools import partial
 from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import Request
+from jinja2 import TemplateError, TemplateSyntaxError
 
 from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.generate_config import (
@@ -597,6 +598,35 @@ class OpenaiEndpoint(object):
             generate_config=gen_config,
         )
 
+    def _render_chat_input(self, renderer, chat_request: ChatCompletionRequest):
+        try:
+            return renderer.render_chat(chat_request)
+        except ValueError as e:
+            # Rendering parses the caller's messages and tool definitions, and every renderer
+            # signals a malformed one with a bare ValueError (role unknown, tool history
+            # inconsistent, template refuses the message sequence). Untyped, it reaches the
+            # HTTP layer as a server fault, so callers retry a request that can never succeed.
+            # TypeError is deliberately left alone: it means one of our own calls was shaped
+            # wrongly, and reporting that as a bad request would bury a real incident.
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR, str(e)
+            ) from e
+        except TemplateSyntaxError as e:
+            # A template that does not even parse is our bug, unless the caller wrote it.
+            if not chat_request.user_template:
+                raise
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR, str(e)
+            ) from e
+        except TemplateError as e:
+            # HuggingFace chat templates reject an unusable conversation by calling
+            # raise_exception(), which arrives here as TemplateError rather than ValueError
+            # (basic_renderer installs it as a jinja global). That is the default renderer,
+            # so without this branch the most common malformed-input rejection stays a 5xx.
+            raise FtRuntimeException(
+                ExceptionType.ERROR_INPUT_FORMAT_ERROR, str(e)
+            ) from e
+
     def render_chat(self, chat_request: ChatCompletionRequest):
         renderer = (
             self.template_renderer if chat_request.user_template else self.chat_renderer
@@ -605,7 +635,7 @@ class OpenaiEndpoint(object):
         if len(chat_request.messages) > 0 and chat_request.messages[-1].partial:
             prepopulate_str = str(chat_request.messages[-1].content)
             chat_request.messages.pop()
-        rendered_input = renderer.render_chat(chat_request)
+        rendered_input = self._render_chat_input(renderer, chat_request)
         if prepopulate_str != "":
             rendered_input.rendered_prompt += prepopulate_str
             rendered_input.input_ids += self.tokenizer.encode(prepopulate_str)
@@ -768,7 +798,7 @@ class OpenaiEndpoint(object):
         renderer = (
             self.template_renderer if chat_request.user_template else self.chat_renderer
         )
-        rendered_input = self.render_chat(chat_request)
+        rendered_input = self._render_chat_input(renderer, chat_request)
         generate_config = self._extract_generation_config(
             chat_request, rendered_input.input_ids, renderer
         )
