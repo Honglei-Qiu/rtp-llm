@@ -49,6 +49,35 @@ class TaggedSequenceLengthModel:
         return PyModelOutputs(inputs.input_hiddens + signature)
 
 
+class ScalarTokenCountRecorder:
+    def __init__(self) -> None:
+        self.values = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    def prepare_cuda_graph(self, attention_inputs) -> None:
+        self.values[0].fill_(attention_inputs.total_tokens)
+        self.values[1].fill_(attention_inputs.context_total_kv_length)
+
+
+class ScalarTokenCountModel:
+    """Expose scalar token counts consumed during replay preparation."""
+
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False):
+        attention_inputs = inputs.attention_inputs
+        if isinstance(attention_inputs, dict):
+            return {tag: ScalarTokenCountRecorder() for tag in attention_inputs}
+        return ScalarTokenCountRecorder()
+
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        if isinstance(fmha_impl, dict):
+            values = torch.stack(
+                [fmha_impl[tag].values for tag in sorted(fmha_impl)]
+            ).sum(dim=0)
+        else:
+            values = fmha_impl.values
+        signature = values.sum().to(inputs.input_hiddens.dtype)
+        return PyModelOutputs(inputs.input_hiddens + signature)
+
+
 def _tag_attention_inputs(
     common: PyAttentionInputs, tags: list[str], values: dict[str, int]
 ) -> dict[str, PyAttentionInputs]:
@@ -96,7 +125,10 @@ def _build_common_inputs(
     attention_inputs.kv_cache_block_id_device = (
         attention_inputs.kv_cache_kernel_block_id_device
     )
-    inputs.attention_inputs = _tag_attention_inputs(attention_inputs, tags, values)
+    if tags:
+        inputs.attention_inputs = _tag_attention_inputs(attention_inputs, tags, values)
+    else:
+        inputs.attention_inputs = attention_inputs
     return inputs
 
 
@@ -142,27 +174,36 @@ def _build_decode_inputs(
 
 
 def _build_prefill_inputs(
-    tags: list[str], values: dict[str, int], seq_len: int = 4
+    tags: list[str],
+    values: dict[str, int],
+    sequence_lengths: tuple[int, ...] = (4,),
 ) -> PyModelInputs:
+    total_tokens = sum(sequence_lengths)
+    batch_size = len(sequence_lengths)
     attention_inputs = PyAttentionInputs()
     attention_inputs.is_prefill = True
     attention_inputs.is_target_verify = False
     attention_inputs.input_lengths = torch.tensor(
-        [seq_len], dtype=torch.int32
+        sequence_lengths, dtype=torch.int32
     ).pin_memory()
-    attention_inputs.prefix_lengths = torch.zeros(1, dtype=torch.int32).pin_memory()
-    attention_inputs.cu_seqlens = torch.tensor(
-        [0, seq_len], dtype=torch.int32
+    attention_inputs.prefix_lengths = torch.zeros(
+        batch_size, dtype=torch.int32
+    ).pin_memory()
+    attention_inputs.cu_seqlens = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32),
+            attention_inputs.input_lengths.cumsum(dim=0),
+        )
     ).pin_memory()
     attention_inputs.cu_seqlens_device = attention_inputs.cu_seqlens.cuda()
     attention_inputs.cu_kv_seqlens_device = attention_inputs.cu_seqlens_device.clone()
-    attention_inputs.context_total_kv_length = seq_len
+    attention_inputs.context_total_kv_length = total_tokens
     return _build_common_inputs(
         attention_inputs,
         tags,
         values,
-        batch_size=1,
-        token_count=seq_len,
+        batch_size=batch_size,
+        token_count=total_tokens,
         block_count=1,
     )
 
@@ -408,6 +449,88 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
                     output.hidden_states,
                     expected_signature.unsqueeze(0).expand_as(output.hidden_states),
                 )
+
+    def test_target_verify_refreshes_scalar_token_counts(self) -> None:
+        query_len = 5
+        prefix_len = 11
+        topologies = (
+            ("common", [], {}),
+            ("tagged", GROUP_TAGS, {"full": 2, "aux": 1}),
+        )
+        for topology, group_tags, block_values in topologies:
+            runner = CudaGraphRunner()
+            runner.init_decode(
+                ScalarTokenCountModel(),
+                HIDDEN_SIZE,
+                64,
+                TOKENS_PER_BLOCK,
+                TOKENS_PER_BLOCK,
+                [4],
+                group_tags,
+                True,
+                query_len,
+            )
+
+            for batch_size in (1, 2, 4):
+                with self.subTest(topology=topology, batch_size=batch_size):
+                    inputs = _build_target_verify_inputs(
+                        group_tags,
+                        block_values,
+                        batch_size=batch_size,
+                        query_len=query_len,
+                        prefix_len=prefix_len,
+                    )
+                    self.assertTrue(runner.canRun(inputs))
+                    output = runner.forward(inputs)
+                    torch.cuda.synchronize()
+                    recorder_count = max(1, len(group_tags))
+                    expected = recorder_count * batch_size * (
+                        query_len + query_len + prefix_len
+                    )
+                    torch.testing.assert_close(
+                        output.hidden_states,
+                        torch.full_like(output.hidden_states, expected),
+                    )
+
+    def test_prefill_refreshes_scalar_token_counts(self) -> None:
+        topologies = (
+            ("common", [], {}),
+            ("tagged", GROUP_TAGS, {"full": 2, "aux": 1}),
+        )
+        for topology, group_tags, block_values in topologies:
+            for sequence_lengths in ((3,), (2, 3)):
+                with self.subTest(
+                    topology=topology, sequence_lengths=sequence_lengths
+                ):
+                    total_tokens = sum(sequence_lengths)
+                    runner = CudaGraphRunner()
+                    runner.init_prefill(
+                        ScalarTokenCountModel(),
+                        2,
+                        8,
+                        TOKENS_PER_BLOCK,
+                        TOKENS_PER_BLOCK,
+                        [8],
+                        HIDDEN_SIZE,
+                        group_tags,
+                    )
+
+                    inputs = _build_prefill_inputs(
+                        group_tags,
+                        block_values,
+                        sequence_lengths=sequence_lengths,
+                    )
+                    self.assertTrue(runner.canRun(inputs))
+                    output = runner.forward(inputs)
+                    torch.cuda.synchronize()
+                    recorder_count = max(1, len(group_tags))
+                    torch.testing.assert_close(
+                        output.hidden_states,
+                        torch.full_like(
+                            output.hidden_states,
+                            recorder_count * total_tokens * 2,
+                        ),
+                    )
 
 
 if __name__ == "__main__":
