@@ -29,7 +29,10 @@ from rtp_llm.server.server_args.grpc_group_args import (
     init_dash_sc_grpc_group_args,
     init_model_grpc_group_args,
 )
-from rtp_llm.server.server_args.hw_kernel_group_args import init_hw_kernel_group_args
+from rtp_llm.server.server_args.hw_kernel_group_args import (
+    init_hw_kernel_group_args,
+    validate_decode_capture_batch_sizes,
+)
 from rtp_llm.server.server_args.jit_group_args import init_jit_group_args
 from rtp_llm.server.server_args.kv_cache_group_args import init_kv_cache_group_args
 from rtp_llm.server.server_args.load_group_args import init_load_group_args
@@ -550,5 +553,13 @@ def setup_args(args: Optional[Sequence[str]] = None) -> PyEnvConfigs:
         py_env_configs.runtime_config.model_warm_up,
     )
 
+    if py_env_configs.py_hw_kernel_config.enable_cuda_graph:
+        try:
+            validate_decode_capture_batch_sizes(
+                py_env_configs.py_hw_kernel_config.decode_capture_batch_sizes,
+                py_env_configs.concurrency_config.concurrency_limit,
+            )
+        except ValueError as error:
+            parser.error(str(error))
 
     return py_env_configs

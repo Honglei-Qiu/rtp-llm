@@ -423,6 +423,33 @@ class ServerArgsSetTest(TestCase):
             1,
         )
 
+    def test_cuda_graph_capture_batch_must_not_exceed_concurrency_limit(self):
+        os.environ["ENABLE_CUDA_GRAPH"] = "1"
+        os.environ["CONCURRENCY_LIMIT"] = "8"
+        os.environ["DECODE_CAPTURE_CONFIG"] = "1,2,4,8,16"
+        sys.argv = ["prog"]
+
+        import rtp_llm.server.server_args.server_args
+
+        importlib.reload(rtp_llm.server.server_args.server_args)
+        with self.assertRaises(SystemExit):
+            rtp_llm.server.server_args.server_args.setup_args()
+
+    def test_cuda_graph_capture_batch_accepts_concurrency_limit(self):
+        os.environ["ENABLE_CUDA_GRAPH"] = "1"
+        os.environ["CONCURRENCY_LIMIT"] = "8"
+        os.environ["DECODE_CAPTURE_CONFIG"] = "1,2,4,8"
+        sys.argv = ["prog"]
+
+        import rtp_llm.server.server_args.server_args
+
+        importlib.reload(rtp_llm.server.server_args.server_args)
+        py_env_configs = rtp_llm.server.server_args.server_args.setup_args()
+        self.assertEqual(
+            py_env_configs.py_hw_kernel_config.decode_capture_batch_sizes,
+            [1, 2, 4, 8],
+        )
+
     def test_pdfusion_scheduler_mode_config(self):
         """Test that pdfusion_scheduler_mode is opt-in and decode_prefill_ratio is configurable."""
         sys.argv = ["prog"]
