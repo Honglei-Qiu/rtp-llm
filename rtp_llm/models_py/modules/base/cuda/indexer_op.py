@@ -445,8 +445,21 @@ class IndexerOp(nn.Module):
             fast_topk_transform_ragged_fused,
         )
 
-        # Gather quantized key from cache for prefill
-        num_tokens = q_fp8.shape[0]
+        # Gather quantized key from cache for prefill. ks/ke index the full KV
+        # extent (input_len + prefix_len per request), which exceeds the query row
+        # count whenever a request reuses a cached prefix, so the buffers must be
+        # sized by that extent: the gather kernel clamps to dst_k.size(0) and
+        # would leave the tail rows uninitialized while fp8_mqa_logits still
+        # reads up to ke.
+        num_query_tokens = q_fp8.shape[0]
+        num_tokens = fmha_params.total_kv_tokens
+        if num_tokens < num_query_tokens:
+            # Not an assert: this is the only guard between a wrong extent and the
+            # out-of-bounds read above, and asserts vanish under python -O.
+            raise RuntimeError(
+                f"total_kv_tokens ({num_tokens}) must cover the query rows "
+                f"({num_query_tokens}); ks/ke were built over the full KV extent"
+            )
         k_fp8 = torch.empty(
             (num_tokens, self.index_head_dim),
             dtype=torch.float8_e4m3fn,

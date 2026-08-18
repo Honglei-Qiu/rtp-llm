@@ -72,6 +72,11 @@ public:
     torch::Tensor ks;
     torch::Tensor ke;
 
+    // Sum of (input_len + prefix_len) over the prefill batch: the KV extent that
+    // ks/ke index into. Exceeds the query row count whenever a request reuses a
+    // cached prefix. 0 outside prefill.
+    int total_kv_tokens = 0;
+
     // schedule_metadata for deep_gemm
     torch::Tensor schedule_metadata;
 

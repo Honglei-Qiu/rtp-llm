@@ -77,3 +77,11 @@ py_test (
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20'},
 )
+
+py_test (
+    name = "ragged_kv_extent_test",
+    srcs = ["ragged_kv_extent_test.py"],
+    deps = py_test_deps,
+    tags = ["open_skip", "H20"],
+    exec_properties = {'gpu':'H20'},
+)

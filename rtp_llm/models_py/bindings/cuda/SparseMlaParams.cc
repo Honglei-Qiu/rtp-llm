@@ -144,6 +144,7 @@ void SparseMlaParams::fillParamsInternal(bool                 is_prefill,
             }
             k_offset += kv_len;
         }
+        total_kv_tokens = static_cast<int>(k_offset);
     }
 }
 
@@ -468,6 +469,7 @@ void SparseMlaParams::fillParams(torch_ext::PyAttentionInputs attn_inputs,
             topk_indices_offset = torch::empty({0}, options_cuda);
             ks                  = torch::empty({0}, options_cuda);
             ke                  = torch::empty({0}, options_cuda);
+            total_kv_tokens     = 0;
         }
     } else {
         expanded_seq_lens = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
@@ -476,6 +478,9 @@ void SparseMlaParams::fillParams(torch_ext::PyAttentionInputs attn_inputs,
         topk_indices_offset = torch::empty({0}, options_cuda);
         ks                  = torch::empty({0}, options_cuda);
         ke                  = torch::empty({0}, options_cuda);
+        // Reset here rather than in fillParamsInternal: that is skipped entirely
+        // when batch_size is 0, which would leave the previous prefill extent.
+        total_kv_tokens     = 0;
 
         if (batch_size != 0) {
             ensureTensorSize(batch_size, batch_size, forbid_realloc);
@@ -514,6 +519,7 @@ void registerPySparseMlaParams(pybind11::module& m) {
         .def_readonly("topk_indices_offset", &SparseMlaParams::topk_indices_offset)
         .def_readonly("ks", &SparseMlaParams::ks)
         .def_readonly("ke", &SparseMlaParams::ke)
+        .def_readonly("total_kv_tokens", &SparseMlaParams::total_kv_tokens)
         .def_readwrite("schedule_metadata", &SparseMlaParams::schedule_metadata)
         .def(
             "fill_cp_plan_params",
