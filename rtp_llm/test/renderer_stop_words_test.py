@@ -157,6 +157,73 @@ class RemoveStopWordIdsTest(TestCase):
         self.assertEqual(result, [100])
 
 
+class FinishReasonLimitTest(TestCase):
+    @staticmethod
+    def _make_renderer(eos_token_id=2, stop_words_id_list=None):
+        renderer = Mock(spec=CustomChatRenderer)
+        renderer.max_seq_len = 100
+        renderer.eos_token_id = eos_token_id
+        renderer.stop_words_id_list = stop_words_id_list or []
+        renderer.get_all_extra_stop_word_ids_list = Mock(return_value=[])
+        renderer._check_finish_reason = CustomChatRenderer._check_finish_reason.__get__(
+            renderer
+        )
+        renderer._remove_stop_word_ids = (
+            CustomChatRenderer._remove_stop_word_ids.__get__(renderer)
+        )
+        return renderer
+
+    @staticmethod
+    def _update_status(renderer, token_ids, max_new_tokens=100, input_len=3):
+        status = StreamStatus(Mock())
+        output = GenerateOutput(
+            output_ids=torch.tensor([token_ids]),
+            finished=True,
+            aux_info=AuxInfo(input_len=input_len),
+        )
+        status.update_output(
+            output,
+            lambda ids, input_length: renderer._check_finish_reason(
+                ids, input_length, max_new_tokens=max_new_tokens
+            ),
+            renderer._remove_stop_word_ids,
+        )
+        return status
+
+    def test_backend_capacity_terminal_is_length(self):
+        status = self._update_status(self._make_renderer(), [101, 102])
+        self.assertEqual(status.finish_reason, FinisheReason.length)
+
+    def test_backend_terminal_stop_in_burst_is_stop(self):
+        status = self._update_status(
+            self._make_renderer(stop_words_id_list=[[201, 202]]),
+            [101, 201, 202, 103],
+        )
+        self.assertEqual(status.output_ids, [101])
+        self.assertEqual(status.finish_reason, FinisheReason.stop)
+
+    def test_backend_terminal_eos_in_burst_is_stop(self):
+        status = self._update_status(self._make_renderer(eos_token_id=2), [101, 2, 103])
+        self.assertEqual(status.output_ids, [101])
+        self.assertEqual(status.finish_reason, FinisheReason.stop)
+
+    def test_backend_terminal_stop_overrides_request_length(self):
+        status = self._update_status(
+            self._make_renderer(stop_words_id_list=[[201, 202]]),
+            [101, 201, 202, 103],
+            max_new_tokens=4,
+        )
+        self.assertEqual(status.output_ids, [101])
+        self.assertEqual(status.finish_reason, FinisheReason.stop)
+
+    def test_backend_terminal_eos_overrides_model_length(self):
+        renderer = self._make_renderer(eos_token_id=2)
+        renderer.max_seq_len = 7
+        status = self._update_status(renderer, [101, 2, 103, 104], input_len=3)
+        self.assertEqual(status.output_ids, [101])
+        self.assertEqual(status.finish_reason, FinisheReason.stop)
+
+
 class ProcessStopWordsTest(TestCase):
     """Test _process_stop_words method which handles string-level stop word processing."""
 

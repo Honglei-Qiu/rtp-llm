@@ -127,6 +127,13 @@ class StreamStatus:
         self.output_ids = remove_stop_word_ids_func(
             self.output_ids_list, delta_output_ids
         )
+        if bool(output.finished):
+            if len(self.output_ids) < len(self.output_ids_list):
+                self.finish_reason = FinisheReason.stop
+            elif self.finish_reason is None:
+                # A backend terminal without EOS/stop or a request/model limit is
+                # a backend-enforced capacity boundary.
+                self.finish_reason = FinisheReason.length
 
     def update_result(self):
         self.last_token_length = len(self.output_ids) - len(self.last_output_ids)
