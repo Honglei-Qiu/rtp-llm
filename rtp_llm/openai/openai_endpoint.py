@@ -6,7 +6,11 @@ from typing import Any, AsyncGenerator, List, Optional
 
 from fastapi import Request
 
-from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.config.exceptions import (
+    ExceptionCategory,
+    ExceptionType,
+    FtRuntimeException,
+)
 from rtp_llm.config.generate_config import (
     GenerateConfig,
     ReturnAllProbsMode,
@@ -742,13 +746,21 @@ class OpenaiEndpoint(object):
         all_configs = []
         for i, chat_request in enumerate(batch_request.requests):
             if chat_request.stream:
-                raise ValueError(
-                    f"batch chat completion does not support streaming (request index {i})"
+                raise FtRuntimeException(
+                    ExceptionType.ERROR_INPUT_FORMAT_ERROR,
+                    f"batch chat completion does not support streaming (request index {i})",
                 )
             chat_request.stream = False
-            gen_input, generate_config = self._prepare_chat_input(
-                base_request_id + i, chat_request
-            )
+            try:
+                gen_input, generate_config = self._prepare_chat_input(
+                    base_request_id + i, chat_request
+                )
+            except FtRuntimeException as e:
+                if e.exception_type.category != ExceptionCategory.BAD_REQUEST:
+                    raise
+                raise FtRuntimeException(
+                    e.exception_type, f"request index {i}: {e.message}"
+                ) from e
             generate_config.is_streaming = False
             inputs.append(gen_input)
             all_configs.append(generate_config)

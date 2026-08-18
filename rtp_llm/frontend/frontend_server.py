@@ -11,6 +11,7 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from rtp_llm.access_logger.access_logger import AccessLogger
+from rtp_llm.config.exceptions import FtRuntimeException
 from rtp_llm.config.log_config import get_log_path
 from rtp_llm.config.model_config import (
     update_stop_words_from_env,
@@ -23,7 +24,7 @@ from rtp_llm.model_factory import ModelFactory
 from rtp_llm.openai.api_datatype import ChatCompletionRequest
 from rtp_llm.openai.openai_endpoint import OpenaiEndpoint
 from rtp_llm.ops import SpecialTokens, TaskType
-from rtp_llm.server.misc import format_exception
+from rtp_llm.server.misc import exception_http_status, format_exception
 from rtp_llm.server.request_headers import extract_request_headers
 from rtp_llm.structure.request_constants import request_id_field_name
 from rtp_llm.utils.complete_response_async_generator import (
@@ -187,10 +188,16 @@ class FrontendServer(object):
         self,
         request: Dict[str, Any],
         response: CompleteResponseAsyncGenerator,
+        first: Any = None,
     ):
         is_openai_response = request.get("stream", False)
         response_data_prefix = "data: " if is_openai_response else "data:"
         try:
+            if first is not None:
+                yield response_data_prefix + first.model_dump_json(
+                    exclude_none=True
+                ) + "\r\n\r\n"
+                await asyncio.sleep(0)
             async for res in response:
                 data_str = res.model_dump_json(exclude_none=True)
                 yield response_data_prefix + data_str + "\r\n\r\n"
@@ -347,6 +354,8 @@ class FrontendServer(object):
                     responses=[r.model_dump(exclude_none=True) for r in responses]
                 ).model_dump()
             )
+        except FtRuntimeException as e:
+            return self._handle_exception(request.model_dump(exclude_none=True), e)
         finally:
             self._global_controller.decrement()
 
@@ -382,7 +391,9 @@ class FrontendServer(object):
             assert self._openai_endpoint != None
             return self._openai_endpoint.chat_render(request)
         except Exception as e:
-            return ORJSONResponse(format_exception(e), status_code=500)
+            return ORJSONResponse(
+                format_exception(e), status_code=exception_http_status(e)
+            )
 
     def _handle_exception(self, request: Dict[str, Any], e: BaseException):
         exception_json = format_exception(e)
@@ -413,7 +424,7 @@ class FrontendServer(object):
             )
             self._access_logger.log_exception_access(request, e, exception_json)
 
-        rep = ORJSONResponse(exception_json, status_code=500)
+        rep = ORJSONResponse(exception_json, status_code=exception_http_status(e))
         return rep
 
     async def _call_generate_with_report(
@@ -516,8 +527,19 @@ class FrontendServer(object):
         res = await self._call_generate_with_report(generate_call)
 
         if is_streaming:
+            # Input validation runs lazily on the first step, so it has to happen BEFORE the
+            # StreamingResponse commits HTTP 200 — otherwise a caller error can only be
+            # delivered as an in-band frame and clients keep retrying a doomed request.
+            try:
+                first = await res.__anext__()
+            except StopAsyncIteration:
+                first = None
+            except BaseException:
+                await res.aclose()
+                raise
             return StreamingResponse(
-                self.stream_response(req, res), media_type="text/event-stream"
+                self.stream_response(req, res, first=first),
+                media_type="text/event-stream",
             )
         async for x in res:
             if await raw_request.is_disconnected():
@@ -542,7 +564,9 @@ class FrontendServer(object):
                 token_ids = self._frontend_worker.pipeline.encode(prompt)
             return ORJSONResponse({"token_ids": token_ids})
         except Exception as e:
-            return ORJSONResponse(format_exception(e), status_code=500)
+            return ORJSONResponse(
+                format_exception(e), status_code=exception_http_status(e)
+            )
 
     def tokenizer_encode(self, req: Union[str, Dict[Any, Any]]):
         try:
@@ -562,7 +586,9 @@ class FrontendServer(object):
                 response = TokenizerEncodeResponse(token_ids=token_ids, tokens=tokens)
             return ORJSONResponse(content=response.model_dump(exclude_none=True))
         except Exception as e:
-            return ORJSONResponse(format_exception(e), status_code=500)
+            return ORJSONResponse(
+                format_exception(e), status_code=exception_http_status(e)
+            )
 
     def check_health(self):
         assert self._frontend_worker is not None

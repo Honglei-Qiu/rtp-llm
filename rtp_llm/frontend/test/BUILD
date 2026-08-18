@@ -29,6 +29,18 @@ py_test(
 )
 
 py_test(
+    name = "frontend_renderer_input_error_test",
+    srcs = [
+        "frontend_renderer_input_error_test.py",
+    ],
+    deps = [
+        "//rtp_llm:fastapi",
+        "//rtp_llm:frontend",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
     name = "frontend_shutdown_test",
     srcs = [
         "frontend_shutdown_test.py",

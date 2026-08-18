@@ -3,9 +3,27 @@ import functools
 import traceback
 from typing import Any, Callable, Dict
 
-from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
+from rtp_llm.config.exceptions import (
+    ExceptionCategory,
+    ExceptionType,
+    FtRuntimeException,
+)
 from rtp_llm.lora.lora_exception import LoraCountException
 from rtp_llm.utils.concurrency_controller import ConcurrencyException
+
+
+def exception_http_status(e: BaseException) -> int:
+    # A client-caused condition must not surface as 5xx, or clients retry a request that can
+    # never succeed. BAD_REQUEST is the obvious case; TOO_LONG (prompt exceeds the limit) and
+    # UNSUPPORTED (operation the model cannot perform) are equally the caller's fault.
+    client_fault = {
+        ExceptionCategory.BAD_REQUEST,
+        ExceptionCategory.TOO_LONG,
+        ExceptionCategory.UNSUPPORTED,
+    }
+    if isinstance(e, FtRuntimeException) and e.exception_type.category in client_fault:
+        return 400
+    return 500
 
 
 def format_exception(e: BaseException):
