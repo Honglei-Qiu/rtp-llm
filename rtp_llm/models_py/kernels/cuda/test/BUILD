@@ -66,6 +66,12 @@ py_test (
 )
 
 py_test(
+    name = "deepgemm_wrapper_test",
+    srcs = ["deepgemm_wrapper_test.py"],
+    deps = py_test_deps,
+)
+
+py_test(
     name = "test_xqa_batch_decode",
     srcs = ["test_xqa_batch_decode.py"],
     deps = py_test_deps + select({
