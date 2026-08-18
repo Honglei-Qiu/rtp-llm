@@ -1,30 +1,334 @@
+import json
 from typing import Optional
 from unittest import IsolatedAsyncioTestCase, main
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import torch
 
+from rtp_llm.config.exceptions import ExceptionType, FtRuntimeException
 from rtp_llm.config.py_config_modules import GenerateEnvConfig
 from rtp_llm.openai.api_datatype import (
     ChatCompletionRequest,
     ChatMessage,
+    FinisheReason,
     FunctionCall,
+    GPTFunctionDefinition,
+    GPTToolDefinition,
     RoleEnum,
     ToolCall,
 )
-from rtp_llm.openai.renderers.custom_renderer import RendererParams
+from rtp_llm.openai.renderers.custom_renderer import (
+    CustomChatRenderer,
+    RendererParams,
+    ThinkStatus,
+)
 from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
     ReasoningToolBaseRenderer,
     ReasoningToolStreamStatus,
 )
+from rtp_llm.openai.renderers.sglang_helpers.entrypoints.openai.protocol import (
+    Function,
+    Tool,
+)
 from rtp_llm.openai.renderers.sglang_helpers.function_call.base_format_detector import (
     BaseFormatDetector,
+    ToolParseError,
+)
+from rtp_llm.openai.renderers.sglang_helpers.function_call.core_types import (
+    StreamingParseResult,
+)
+from rtp_llm.openai.renderers.sglang_helpers.function_call.glm47_moe_detector import (
+    Glm47MoeDetector,
 )
 from rtp_llm.openai.renderers.sglang_helpers.reasoning_parser import (
     Qwen3Detector,
     ReasoningParser,
 )
 from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
+
+
+class ToolParsingFailureTest(IsolatedAsyncioTestCase):
+    @staticmethod
+    def _non_stream_request() -> ChatCompletionRequest:
+        return ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")],
+            tools=[
+                GPTToolDefinition(
+                    function=GPTFunctionDefinition(
+                        name="lookup",
+                        description="lookup a value",
+                        parameters={
+                            "type": "object",
+                            "properties": {"id": {"type": "string"}},
+                        },
+                    )
+                )
+            ],
+        )
+
+    @staticmethod
+    def _non_stream_status(
+        text: str, finish_reason: FinisheReason
+    ) -> tuple[ReasoningToolStreamStatus, GenerateOutput]:
+        status = ReasoningToolStreamStatus(
+            ToolParsingFailureTest._non_stream_request(),
+            Glm47MoeDetector(),
+            None,
+        )
+        status.finish_reason = finish_reason
+        status.delta_output_string = text
+        output = Mock(spec=GenerateOutput)
+        output.aux_info = AuxInfo(input_len=1, output_len=2, reuse_len=0)
+        status.output = output
+        return status, output
+
+    @staticmethod
+    def _non_stream_renderer() -> ReasoningToolBaseRenderer:
+        renderer = object.__new__(ReasoningToolBaseRenderer)
+        renderer._generate_log_probs = AsyncMock(return_value=None)
+        return renderer
+
+    async def test_tool_parse_error_is_terminal(self):
+        renderer = Mock(spec=ReasoningToolBaseRenderer)
+        renderer._extract_tool_calls_content = (
+            ReasoningToolBaseRenderer._extract_tool_calls_content.__get__(renderer)
+        )
+        detector = Mock(spec=BaseFormatDetector)
+        detector.parse_streaming_increment.side_effect = ToolParseError(
+            "malformed tool arguments"
+        )
+        raw_tool_text = "<tool_call>lookup<arg_key>id</arg_key></tool_call>"
+
+        with patch(
+            "rtp_llm.openai.renderers.reasoning_tool_base_renderer."
+            "rtp_tools_to_sglang_tools",
+            return_value=[Mock(name="converted_tool")],
+        ):
+            with self.assertRaises(FtRuntimeException) as context:
+                await renderer._extract_tool_calls_content(
+                    detector,
+                    [Mock(name="tool")],
+                    raw_tool_text,
+                    is_streaming=True,
+                )
+
+        self.assertEqual(
+            context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
+        )
+        self.assertEqual(context.exception.message, "malformed tool arguments")
+
+    def test_finalization_maps_incomplete_tool_to_sanitized_terminal_error(self):
+        renderer = Mock(spec=ReasoningToolBaseRenderer)
+        renderer._finalize_tool_detector = (
+            ReasoningToolBaseRenderer._finalize_tool_detector.__get__(renderer)
+        )
+        detector = Mock(spec=BaseFormatDetector)
+        detector.finalize_streaming.side_effect = ToolParseError(
+            "incomplete tool call"
+        )
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")], tools=[]
+        )
+        status = ReasoningToolStreamStatus(request, detector, None)
+        status.finish_reason = FinisheReason.stop
+
+        with patch("logging.error") as log_error:
+            with self.assertRaises(FtRuntimeException) as context:
+                renderer._finalize_tool_detector(status)
+
+        self.assertEqual(
+            context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
+        )
+        self.assertEqual(context.exception.message, "incomplete tool call")
+        detector.finalize_streaming.assert_called_once_with(truncated=False)
+        self.assertNotIn("<tool_call>", repr(log_error.call_args))
+
+    def test_finalization_passes_length_and_releases_partial_text(self):
+        renderer = Mock(spec=ReasoningToolBaseRenderer)
+        renderer._finalize_tool_detector = (
+            ReasoningToolBaseRenderer._finalize_tool_detector.__get__(renderer)
+        )
+        detector = Mock(spec=BaseFormatDetector)
+        detector.finalize_streaming.return_value = StreamingParseResult(
+            normal_text="<tool_ca"
+        )
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")], tools=[]
+        )
+        status = ReasoningToolStreamStatus(request, detector, None)
+        status.finish_reason = FinisheReason.length
+        status.delta_output_string = "prefix"
+
+        renderer._finalize_tool_detector(status)
+
+        detector.finalize_streaming.assert_called_once_with(truncated=True)
+        self.assertEqual(status.delta_output_string, "<tool_caprefix")
+
+    async def test_flush_prepends_detector_tail_before_existing_buffer(self):
+        renderer = object.__new__(ReasoningToolBaseRenderer)
+        renderer._generate_log_probs = AsyncMock(return_value=None)
+        renderer._generate_stream_response = AsyncMock(return_value="flushed")
+        detector = Mock(spec=BaseFormatDetector)
+        detector.finalize_streaming.return_value = StreamingParseResult(
+            normal_text="<tool_ca"
+        )
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")], tools=[]
+        )
+        status = ReasoningToolStreamStatus(request, detector, None)
+        status.finish_reason = FinisheReason.length
+        status.delta_output_string = "buffered-stop-prefix"
+        output = Mock(spec=GenerateOutput)
+        output.aux_info = AuxInfo(input_len=1, output_len=2, reuse_len=0)
+        status.output = output
+
+        response = await renderer._flush_buffer(
+            [status], [], True, [ThinkStatus(is_streaming=True)]
+        )
+
+        self.assertEqual(response, "flushed")
+        detector.finalize_streaming.assert_called_once_with(truncated=True)
+        output_items = renderer._generate_stream_response.await_args.args[0]
+        self.assertEqual(output_items[0].output_str, "<tool_cabuffered-stop-prefix")
+
+    async def test_length_flush_discards_real_pending_transaction(self):
+        renderer = object.__new__(ReasoningToolBaseRenderer)
+        renderer._generate_log_probs = AsyncMock(return_value=None)
+        renderer._generate_stream_response = AsyncMock(return_value="flushed")
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="lookup",
+                description="lookup a value",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        detector = Glm47MoeDetector()
+        detector.parse_streaming_increment(
+            "<tool_call>lookup<arg_key>id</arg_key>", [tool]
+        )
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")], tools=[]
+        )
+        status = ReasoningToolStreamStatus(request, detector, None)
+        status.finish_reason = FinisheReason.length
+        output = Mock(spec=GenerateOutput)
+        output.aux_info = AuxInfo(input_len=1, output_len=2, reuse_len=0)
+        status.output = output
+
+        await renderer._flush_buffer(
+            [status], [], True, [ThinkStatus(is_streaming=True)]
+        )
+        final = await CustomChatRenderer._generate_final(
+            renderer, [status], request, [ThinkStatus(is_streaming=True)]
+        )
+
+        self.assertFalse(status.generating_tool_call)
+        self.assertIsNone(detector._pending_tool_buffer)
+        self.assertEqual(final.choices[0].finish_reason, FinisheReason.length)
+
+    async def test_multi_choice_finalize_error_prevents_entire_flush(self):
+        renderer = object.__new__(ReasoningToolBaseRenderer)
+        renderer._generate_log_probs = AsyncMock(return_value=None)
+        renderer._generate_stream_response = AsyncMock(return_value="unexpected")
+        request = ChatCompletionRequest(
+            messages=[ChatMessage(role=RoleEnum.user, content="test")], tools=[]
+        )
+        statuses = []
+        for _ in range(2):
+            detector = Mock(spec=BaseFormatDetector)
+            detector.finalize_streaming.return_value = StreamingParseResult()
+            status = ReasoningToolStreamStatus(request, detector, None)
+            status.finish_reason = FinisheReason.stop
+            output = Mock(spec=GenerateOutput)
+            output.aux_info = AuxInfo(input_len=1, output_len=2, reuse_len=0)
+            status.output = output
+            statuses.append(status)
+        statuses[1].detector.finalize_streaming.side_effect = ToolParseError(
+            "incomplete tool call"
+        )
+
+        with self.assertRaises(FtRuntimeException):
+            await renderer._flush_buffer(
+                statuses, [], True, [ThinkStatus(is_streaming=True)] * 2
+            )
+
+        statuses[0].detector.finalize_streaming.assert_called_once_with(
+            truncated=False
+        )
+        statuses[1].detector.finalize_streaming.assert_called_once_with(
+            truncated=False
+        )
+        renderer._generate_stream_response.assert_not_awaited()
+
+    async def test_non_stream_length_keeps_complete_call_before_truncated_tail(self):
+        complete = (
+            "<tool_call>lookup"
+            "<arg_key>id</arg_key><arg_value>first</arg_value>"
+            "</tool_call>"
+        )
+        status, output = self._non_stream_status(
+            "before" + complete + "between<tool_call>lookup<arg_key>id</arg_key>",
+            FinisheReason.length,
+        )
+        renderer = self._non_stream_renderer()
+
+        delta = await renderer._process_reasoning_and_tool_calls(
+            status, output, is_streaming=False
+        )
+        final = await CustomChatRenderer._generate_final(
+            renderer, [status], status.request, [ThinkStatus()]
+        )
+
+        self.assertIsNotNone(delta)
+        self.assertEqual(
+            delta.output_str.tool_calls[0].function.name,
+            "lookup",
+        )
+        self.assertEqual(
+            json.loads(delta.output_str.tool_calls[0].function.arguments),
+            {"id": "first"},
+        )
+        self.assertEqual(status.delta_output_string, "beforebetween")
+        self.assertNotIn("<tool_call>", status.delta_output_string)
+        self.assertEqual(final.choices[0].finish_reason, FinisheReason.length)
+
+    async def test_non_stream_length_drops_first_incomplete_call(self):
+        status, output = self._non_stream_status(
+            "visible<tool_call>lookup<arg_key>id</arg_key>",
+            FinisheReason.length,
+        )
+        renderer = self._non_stream_renderer()
+
+        delta = await renderer._process_reasoning_and_tool_calls(
+            status, output, is_streaming=False
+        )
+        final = await CustomChatRenderer._generate_final(
+            renderer, [status], status.request, [ThinkStatus()]
+        )
+
+        self.assertIsNone(delta)
+        self.assertFalse(status.generating_tool_call)
+        self.assertEqual(status.delta_output_string, "visible")
+        self.assertNotIn("<tool_call>", status.delta_output_string)
+        self.assertEqual(final.choices[0].finish_reason, FinisheReason.length)
+
+    async def test_non_stream_stop_rejects_incomplete_call(self):
+        status, output = self._non_stream_status(
+            "visible<tool_call>lookup<arg_key>id</arg_key>",
+            FinisheReason.stop,
+        )
+        renderer = self._non_stream_renderer()
+
+        with self.assertRaises(FtRuntimeException) as context:
+            await renderer._process_reasoning_and_tool_calls(
+                status, output, is_streaming=False
+            )
+
+        self.assertEqual(
+            context.exception.exception_type, ExceptionType.EXECUTION_EXCEPTION
+        )
+        self.assertEqual(context.exception.message, "incomplete tool call")
 
 
 class ProcessReasoningAndToolCallsTest(IsolatedAsyncioTestCase):
@@ -58,6 +362,34 @@ class ProcessReasoningAndToolCallsTest(IsolatedAsyncioTestCase):
         aux_info.reuse_len = 0
         self.output = Mock(spec=GenerateOutput)
         self.output.aux_info = aux_info
+
+    async def test_completed_tool_call_followed_by_length_preserves_length(self):
+        self.status.output = self.output
+        self.status.generating_tool_call = True
+        self.status.finish_reason = FinisheReason.length
+
+        response = await CustomChatRenderer._generate_final(
+            self.renderer,
+            [self.status],
+            self.status.request,
+            [ThinkStatus()],
+        )
+
+        self.assertEqual(response.choices[0].finish_reason, FinisheReason.length)
+
+    async def test_completed_tool_call_uses_tool_calls_finish_reason(self):
+        self.status.output = self.output
+        self.status.generating_tool_call = True
+        self.status.finish_reason = FinisheReason.stop
+
+        response = await CustomChatRenderer._generate_final(
+            self.renderer,
+            [self.status],
+            self.status.request,
+            [ThinkStatus()],
+        )
+
+        self.assertEqual(response.choices[0].finish_reason, FinisheReason.tool_calls)
 
     async def test_only_reasoning_streaming(self):
         # Only reasoning content, no tool calls, streaming mode

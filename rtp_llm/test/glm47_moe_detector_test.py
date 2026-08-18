@@ -14,12 +14,24 @@ Tests cover:
 """
 
 import json
+import os
 import unittest
+from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
+from rtp_llm.openai.renderer_factory_register import (
+    _renderer_factory,
+    _renderer_type_to_module,
+    ensure_renderer_registered,
+)
 from rtp_llm.openai.renderers.sglang_helpers.entrypoints.openai.protocol import (
     Function,
     Tool,
+)
+from rtp_llm.openai.renderers.sglang_helpers.function_call.base_format_detector import (
+    BaseFormatDetector,
+    ToolParseError,
 )
 from rtp_llm.openai.renderers.sglang_helpers.function_call.core_types import (
     StreamingParseResult,
@@ -124,6 +136,41 @@ def collect_streaming_results(
         result = detector.parse_streaming_increment(chunk, tools)
         results.append(result)
     return results
+
+
+class TestGlm5RendererRegistration(unittest.TestCase):
+    def test_glm5_lazy_registry_uses_incremental_tool_renderer(self):
+        glm47_module = "rtp_llm.openai.renderers.chatglm47_renderer"
+        self.assertEqual(_renderer_type_to_module["glm_5"], glm47_module)
+        self.assertEqual(_renderer_type_to_module["glm47_moe"], glm47_module)
+        self.assertEqual(
+            _renderer_type_to_module["glm4_moe"],
+            "rtp_llm.openai.renderers.chatglm45_renderer",
+        )
+
+        self.assertTrue(ensure_renderer_registered("glm_5"))
+        self.assertIs(_renderer_factory["glm_5"], _renderer_factory["glm47_moe"])
+        self.assertIsNot(_renderer_factory["glm_5"], _renderer_factory["glm4_moe"])
+        self.assertEqual(_renderer_factory["glm_5"].__name__, "ChatGlm47Renderer")
+
+
+class TestDetectorFinalContextCompatibility(unittest.TestCase):
+    def test_legacy_detector_override_does_not_receive_context_keyword(self):
+        class LegacyDetector(BaseFormatDetector):
+            def detect_and_parse(self, text, tools):
+                return StreamingParseResult(normal_text=text)
+
+            def has_tool_call(self, text):
+                return False
+
+            def structure_info(self):
+                return lambda name: None
+
+        result = LegacyDetector().detect_and_parse_with_context(
+            "plain text", [], truncated=True
+        )
+
+        self.assertEqual(result.normal_text, "plain text")
 
 
 class TestGlm47MoeDetectorHelpers(unittest.TestCase):
@@ -334,14 +381,16 @@ class TestGlm47MoeDetectorStreaming(unittest.TestCase):
     def setUp(self):
         self.tools = create_basic_tools()
 
-    def test_streaming_tool_name_emission(self):
-        """Test that tool name is emitted as soon as it's complete."""
+    def test_streaming_tool_name_commits_after_complete_block(self):
+        """The tool name is not public until the whole block is valid."""
         detector = Glm47MoeDetector()
 
         chunks = [
-            "<tool_call>",  # Start buffering
-            "get_weather",  # Function name (but need to wait for arg_key or end)
-            "<arg_key>",  # Now we know function name is complete
+            "<tool_call>",
+            "get_weather",
+            "<arg_key>",
+            "city</arg_key><arg_value>Beijing</arg_value>",
+            "</tool_call>",
         ]
 
         results = []
@@ -349,18 +398,12 @@ class TestGlm47MoeDetectorStreaming(unittest.TestCase):
             result = detector.parse_streaming_increment(chunk, self.tools)
             results.append(result)
 
-        # Find the result with name emission
-        all_calls = []
-        for r in results:
-            all_calls.extend(r.calls)
-
-        name_calls = [c for c in all_calls if c.name]
-        self.assertGreaterEqual(
-            len(name_calls),
-            1,
-            f"Expected at least 1 name emission. All calls: {all_calls}",
+        self.assertTrue(all(not result.calls for result in results[:-1]))
+        self.assertEqual(len(results[-1].calls), 1)
+        self.assertEqual(results[-1].calls[0].name, "get_weather")
+        self.assertEqual(
+            json.loads(results[-1].calls[0].parameters), {"city": "Beijing"}
         )
-        self.assertEqual(name_calls[0].name, "get_weather")
 
     def test_streaming_complete_single_chunk(self):
         """Test complete tool call in single chunk (MTP scenario)."""
@@ -473,6 +516,56 @@ class TestGlm47MoeDetectorStreaming(unittest.TestCase):
         self.assertEqual(results[0].normal_text, "Let me check: ")
         self.assertEqual(len(results[0].calls), 0)
 
+    def test_streaming_todowrite_array_argument(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="todowrite",
+                    description="Update the todo list",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "todos": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {"type": "string"},
+                                        "priority": {"type": "string"},
+                                    },
+                                },
+                            }
+                        },
+                        "required": ["todos"],
+                    },
+                ),
+            )
+        ]
+        chunks = [
+            "<tool_call>todowrite<arg_key>todos</arg_key><arg_value>",
+            '[{"content":"inspect","status":"in_progress","priority":"high"}]',
+            "</arg_value></tool_call>",
+        ]
+
+        results = collect_streaming_results(Glm47MoeDetector(), chunks, tools)
+        calls = [call for result in results for call in result.calls]
+        self.assertEqual([call.name for call in calls if call.name], ["todowrite"])
+        parameters = "".join(call.parameters for call in calls if call.parameters)
+        self.assertEqual(
+            json.loads(parameters),
+            {
+                "todos": [
+                    {
+                        "content": "inspect",
+                        "status": "in_progress",
+                        "priority": "high",
+                    }
+                ]
+            },
+        )
+
 
 class TestGlm47MoeDetectorMTP(unittest.TestCase):
     """Test MTP (Multi-Token-Per-step) scenarios."""
@@ -550,23 +643,39 @@ class TestGlm47MoeDetectorMTP(unittest.TestCase):
 
         result = detector.parse_streaming_increment(chunk, self.tools)
 
-        # First tool should be parsed (second may be in buffer for next call)
-        name_calls = [c for c in result.calls if c.name]
-        self.assertGreaterEqual(
-            len(name_calls),
-            1,
-            f"Expected at least 1 name emission. Calls: {result.calls}",
-        )
-
-        # Get second tool if buffered
-        result2 = detector.parse_streaming_increment("", self.tools)
-        all_calls = list(result.calls) + list(result2.calls)
-        all_name_calls = [c for c in all_calls if c.name]
-
-        # Both tools should eventually be parsed
+        # The serving stream can finish after this MTP chunk, so both calls must be
+        # emitted immediately without a synthetic empty follow-up chunk.
+        all_name_calls = [c for c in result.calls if c.name]
         self.assertEqual(
-            len(all_name_calls), 2, f"Expected 2 name emissions. All calls: {all_calls}"
+            len(all_name_calls),
+            2,
+            f"Expected 2 name emissions. All calls: {result.calls}",
         )
+        self.assertEqual([c.tool_index for c in all_name_calls], [0, 1])
+        merged = merge_tool_call_deltas(result.calls)
+        self.assertEqual(json.loads(merged[0]["parameters"]), {"city": "北京"})
+        self.assertEqual(json.loads(merged[1]["parameters"]), {"city": "上海"})
+        self.assertEqual(detector._buffer, "")
+
+    def test_mtp_multiple_tools_and_trailing_text_single_chunk(self):
+        detector = Glm47MoeDetector()
+        chunk = (
+            "准备查询"
+            "<tool_call>get_time</tool_call>"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>深圳</arg_value></tool_call>"
+            "已提交"
+        )
+
+        result = detector.parse_streaming_increment(chunk, self.tools)
+
+        self.assertEqual(result.normal_text, "准备查询已提交")
+        name_calls = [c for c in result.calls if c.name]
+        self.assertEqual([c.name for c in name_calls], ["get_time", "get_weather"])
+        merged = merge_tool_call_deltas(result.calls)
+        self.assertEqual(json.loads(merged[0]["parameters"]), {})
+        self.assertEqual(json.loads(merged[1]["parameters"]), {"city": "深圳"})
+        self.assertEqual(detector._buffer, "")
 
     def test_mtp_tool_boundary_fusion(self):
         """MTP scenario: tool end and next tool start in same chunk."""
@@ -775,6 +884,620 @@ class TestGlm47MoeDetectorArgumentStreaming(unittest.TestCase):
         except json.JSONDecodeError:
             self.fail(f"Arguments should form valid JSON. Got: {full_args}")
 
+    def test_invalid_number_value_is_forwarded_as_valid_json_string(self):
+        tools = create_complex_tools()
+        text = (
+            "<tool_call>calculate"
+            "<arg_key>precision</arg_key><arg_value>abc</arg_value>"
+            "</tool_call>"
+        )
+
+        for chunks in ([text], list(text)):
+            with self.subTest(chunk_count=len(chunks)):
+                calls = [
+                    call
+                    for result in collect_streaming_results(
+                        Glm47MoeDetector(), chunks, tools
+                    )
+                    for call in result.calls
+                ]
+                parameters = "".join(c.parameters for c in calls if c.parameters)
+                self.assertEqual(json.loads(parameters), {"precision": "abc"})
+
+    def test_object_valued_final_argument_closes_outer_arguments(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="configure",
+                    description="Configure a task",
+                    parameters={
+                        "type": "object",
+                        "properties": {"payload": {"type": "object"}},
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>configure"
+            '<arg_key>payload</arg_key><arg_value>{"mode":"fast"}</arg_value>'
+            "</tool_call>"
+        )
+
+        for chunks in ([text], list(text)):
+            with self.subTest(chunk_count=len(chunks)):
+                calls = [
+                    call
+                    for result in collect_streaming_results(
+                        Glm47MoeDetector(), chunks, tools
+                    )
+                    for call in result.calls
+                ]
+                parameters = "".join(c.parameters for c in calls if c.parameters)
+                self.assertEqual(
+                    json.loads(parameters), {"payload": {"mode": "fast"}}
+                )
+
+
+class TestGlm47MoeDetectorHighConcurrency(unittest.TestCase):
+    def setUp(self):
+        self.tools = create_basic_tools()
+
+    def _parse_request(self, request_index: int) -> tuple[str, dict]:
+        city = f"city-{request_index}"
+        text = (
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            f"<arg_value>{city}</arg_value></tool_call>"
+        )
+        chunk_size = request_index % 11 + 1
+        chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+        detector = Glm47MoeDetector()
+        calls = [
+            call
+            for result in collect_streaming_results(detector, chunks, self.tools)
+            for call in result.calls
+        ]
+        names = [call.name for call in calls if call.name]
+        self.assertEqual(names, ["get_weather"])
+        self.assertEqual(detector._buffer, "")
+        parameters = "".join(call.parameters for call in calls if call.parameters)
+        return city, json.loads(parameters)
+
+    def test_256_concurrent_detectors_do_not_cross_request_state(self):
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            results = list(executor.map(self._parse_request, range(256)))
+
+        self.assertEqual(
+            results,
+            [(f"city-{i}", {"city": f"city-{i}"}) for i in range(256)],
+        )
+
+    def test_every_two_chunk_boundary_matches_complete_parse(self):
+        text = (
+            "前缀"
+            "<tool_call>get_time</tool_call>"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>杭州 🌸</arg_value></tool_call>"
+            "后缀"
+        )
+
+        for split in range(len(text) + 1):
+            with self.subTest(split=split):
+                detector = Glm47MoeDetector()
+                results = collect_streaming_results(
+                    detector, [text[:split], text[split:]], self.tools
+                )
+                calls = [call for result in results for call in result.calls]
+                normal_text = "".join(result.normal_text for result in results)
+                merged = merge_tool_call_deltas(calls)
+                self.assertEqual(normal_text, "前缀后缀")
+                self.assertEqual(
+                    [call.name for call in calls if call.name],
+                    ["get_time", "get_weather"],
+                )
+                self.assertEqual(json.loads(merged[0]["parameters"]), {})
+                self.assertEqual(
+                    json.loads(merged[1]["parameters"]), {"city": "杭州 🌸"}
+                )
+                self.assertEqual(detector._buffer, "")
+
+
+class TestGlm47MoeDetectorAtomicToolBlocks(unittest.TestCase):
+    def setUp(self):
+        self.tools = create_basic_tools()
+
+    def test_malformed_then_valid_in_same_chunk_recovers_valid_call(self):
+        # A single chunk with a malformed block (missing arg_value) followed by a
+        # complete valid block. Lenient default must drop only the malformed block
+        # and still emit the trailing valid call — the recovery path must continue
+        # the scan, not break out of it.
+        chunk = (
+            "<tool_call>get_weather<arg_key>city</arg_key></tool_call>"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>NYC</arg_value></tool_call>"
+        )
+
+        detector = Glm47MoeDetector()
+        result = detector.parse_streaming_increment(chunk, self.tools)
+        self.assertEqual([call.name for call in result.calls], ["get_weather"])
+        self.assertIn("NYC", "".join(call.parameters for call in result.calls))
+        self.assertEqual(detector._buffer, "")
+
+        # Strict opt-in still treats the malformed leading block as terminal.
+        with mock.patch.dict(os.environ, {"RTP_LLM_STRICT_TOOL_PARSING": "true"}):
+            with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+                Glm47MoeDetector().parse_streaming_increment(chunk, self.tools)
+
+    def test_missing_arg_value_is_not_partially_emitted(self):
+        prefix = "<tool_call>get_weather<arg_key>city</arg_key>"
+
+        # Default is lenient: the malformed block is dropped, never partially emitted, and the
+        # stream recovers instead of raising.
+        detector = Glm47MoeDetector()
+        partial = detector.parse_streaming_increment(prefix, self.tools)
+        self.assertEqual(partial.calls, [])
+        self.assertEqual(partial.normal_text, "")
+        self.assertEqual(detector.current_tool_id, -1)
+        self.assertEqual(detector.prev_tool_call_arr, [])
+        self.assertEqual(detector.streamed_args_for_tool, [])
+
+        recovered = detector.parse_streaming_increment("</tool_call>", self.tools)
+        self.assertEqual(recovered.calls, [])
+        self.assertEqual(recovered.normal_text, "")
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.current_tool_id, -1)
+        self.assertEqual(detector.prev_tool_call_arr, [])
+        self.assertEqual(detector.streamed_args_for_tool, [])
+
+        # Strict opt-in keeps the malformed block terminal.
+        with mock.patch.dict(os.environ, {"RTP_LLM_STRICT_TOOL_PARSING": "true"}):
+            strict_detector = Glm47MoeDetector()
+            strict_detector.parse_streaming_increment(prefix, self.tools)
+            with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+                strict_detector.parse_streaming_increment("</tool_call>", self.tools)
+
+    def test_deeply_nested_value_is_not_partially_emitted(self):
+        nested_value = "[" * 1100 + "0" + "]" * 1100
+        prefix = (
+            "<tool_call>ask_user_question"
+            "<arg_key>questions</arg_key><arg_value>"
+            f"{nested_value}</arg_value>"
+        )
+
+        # Default is lenient: the over-nested value is dropped, never partially emitted, and the
+        # stream recovers instead of raising.
+        detector = Glm47MoeDetector()
+        partial = detector.parse_streaming_increment(prefix, create_complex_tools())
+        self.assertEqual(partial.calls, [])
+        self.assertEqual(partial.normal_text, "")
+
+        recovered = detector.parse_streaming_increment("</tool_call>", create_complex_tools())
+        self.assertEqual(recovered.calls, [])
+        self.assertEqual(recovered.normal_text, "")
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.current_tool_id, -1)
+        self.assertEqual(detector.prev_tool_call_arr, [])
+        self.assertEqual(detector.streamed_args_for_tool, [])
+
+        # Strict opt-in keeps the over-nested value terminal.
+        with mock.patch.dict(os.environ, {"RTP_LLM_STRICT_TOOL_PARSING": "true"}):
+            strict_detector = Glm47MoeDetector()
+            strict_detector.parse_streaming_increment(prefix, create_complex_tools())
+            with self.assertRaisesRegex(ToolParseError, "failed to parse tool arguments"):
+                strict_detector.parse_streaming_increment("</tool_call>", create_complex_tools())
+
+    def test_non_streaming_missing_arg_value_is_terminal(self):
+        text = "<tool_call>get_weather<arg_key>city</arg_key></tool_call>"
+
+        with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+    def test_non_streaming_unclosed_tool_is_terminal(self):
+        text = (
+            "visible prefix<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Hangzhou</arg_value>"
+        )
+
+        with self.assertRaisesRegex(ToolParseError, "incomplete tool call"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+    def test_non_streaming_unclosed_tool_after_valid_tool_is_terminal(self):
+        text = (
+            "<tool_call>get_time</tool_call>"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+        )
+
+        with self.assertRaisesRegex(ToolParseError, "incomplete tool call"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+    def test_non_streaming_length_keeps_call_before_truncated_tail(self):
+        text = (
+            "before"
+            "<tool_call>get_time</tool_call>"
+            "between"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+        )
+
+        result = Glm47MoeDetector().detect_and_parse_with_context(
+            text, self.tools, truncated=True
+        )
+
+        self.assertEqual(result.normal_text, "beforebetween")
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in result.calls],
+            [(0, "get_time")],
+        )
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_non_streaming_length_drops_first_incomplete_call(self):
+        text = (
+            "visible prefix"
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>Hangzhou"
+        )
+
+        result = Glm47MoeDetector().detect_and_parse_with_context(
+            text, self.tools, truncated=True
+        )
+
+        self.assertEqual(result.normal_text, "visible prefix")
+        self.assertEqual(result.calls, [])
+
+    def test_nested_tool_start_in_function_name_is_terminal(self):
+        text = "<tool_call>broken<tool_call>get_time</tool_call>"
+
+        with self.assertRaisesRegex(ToolParseError, "malformed tool call"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+    def test_tool_start_literal_is_allowed_inside_argument_value(self):
+        text = (
+            "<tool_call>get_weather<arg_key>city</arg_key>"
+            "<arg_value>literal <tool_call> marker</arg_value></tool_call>"
+        )
+
+        non_stream = Glm47MoeDetector().detect_and_parse(text, self.tools)
+        stream = Glm47MoeDetector().parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(
+            json.loads(non_stream.calls[0].parameters),
+            {"city": "literal <tool_call> marker"},
+        )
+        self.assertEqual(
+            json.loads(stream.calls[0].parameters),
+            {"city": "literal <tool_call> marker"},
+        )
+
+    def test_malformed_argument_scan_uses_monotonic_cursor(self):
+        class CountingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.find_calls = 0
+                return instance
+
+            def find(self, *args):
+                self.find_calls += 1
+                return super().find(*args)
+
+        raw_arguments = CountingText("<arg_key>" * 16384)
+
+        with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+            Glm47MoeDetector()._parse_argument_text_strict(
+                raw_arguments, "get_weather", self.tools
+            )
+
+        self.assertEqual(raw_arguments.find_calls, 1)
+
+    def test_non_streaming_unclosed_scan_is_single_pass(self):
+        class CountingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.find_calls = 0
+                return instance
+
+            def find(self, *args):
+                self.find_calls += 1
+                return super().find(*args)
+
+        text = CountingText("<tool_call>" * 16384)
+
+        with self.assertRaisesRegex(ToolParseError, "incomplete tool call"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual(text.find_calls, 2)
+
+    def test_valid_tool_commits_only_after_closing_tag(self):
+        text = (
+            "<tool_call>get_weather"
+            "<arg_key>city</arg_key><arg_value>Hangzhou</arg_value>"
+            "</tool_call>"
+        )
+
+        for split in range(1, len(text)):
+            with self.subTest(split=split):
+                detector = Glm47MoeDetector()
+                partial = detector.parse_streaming_increment(text[:split], self.tools)
+                self.assertEqual(partial.calls, [])
+                self.assertEqual(partial.normal_text, "")
+                self.assertEqual(detector.current_tool_id, -1)
+
+                completed = detector.parse_streaming_increment(
+                    text[split:], self.tools
+                )
+                self.assertEqual(len(completed.calls), 1)
+                self.assertEqual(completed.calls[0].tool_index, 0)
+                self.assertEqual(completed.calls[0].name, "get_weather")
+                self.assertEqual(
+                    json.loads(completed.calls[0].parameters), {"city": "Hangzhou"}
+                )
+                self.assertEqual(detector._buffer, "")
+
+    def test_long_argument_is_parsed_once_at_commit(self):
+        class CountingDetector(Glm47MoeDetector):
+            def __init__(self):
+                super().__init__()
+                self.complete_parse_count = 0
+
+            def _parse_tool_action(self, func_name, raw_arguments, tools):
+                self.complete_parse_count += 1
+                return super()._parse_tool_action(
+                    func_name, raw_arguments, tools
+                )
+
+        detector = CountingDetector()
+        prefix = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>"
+        detector.parse_streaming_increment(prefix, self.tools)
+
+        for _ in range(4096):
+            result = detector.parse_streaming_increment("abcdefgh", self.tools)
+            self.assertEqual(result.calls, [])
+        self.assertEqual(detector.complete_parse_count, 0)
+        self.assertEqual(detector._buffer, "")
+        self.assertLessEqual(
+            len(detector._pending_tool_tail), len(detector.eot_token) - 1
+        )
+
+        completed = detector.parse_streaming_increment(
+            "</arg_value></tool_call>", self.tools
+        )
+        self.assertEqual(detector.complete_parse_count, 1)
+        self.assertEqual(len(completed.calls), 1)
+        self.assertEqual(
+            json.loads(completed.calls[0].parameters),
+            {"city": "abcdefgh" * 4096},
+        )
+
+    def test_natural_eof_rejects_and_clears_incomplete_tool(self):
+        detector = Glm47MoeDetector()
+        detector.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>city</arg_key>", self.tools
+        )
+
+        with self.assertRaisesRegex(ToolParseError, "incomplete tool call"):
+            detector.finalize_streaming()
+
+        self.assertIsNone(detector._pending_tool_buffer)
+        self.assertEqual(detector._pending_tool_tail, "")
+        self.assertEqual(detector.prev_tool_call_arr, [])
+
+    def test_length_finish_discards_only_incomplete_transaction(self):
+        detector = Glm47MoeDetector()
+        first = detector.parse_streaming_increment(
+            "<tool_call>get_time</tool_call>", self.tools
+        )
+        self.assertEqual([call.name for call in first.calls], ["get_time"])
+        detector.parse_streaming_increment(
+            "<tool_call>get_weather<arg_key>city</arg_key>", self.tools
+        )
+
+        finalized = detector.finalize_streaming(truncated=True)
+
+        self.assertEqual(finalized.calls, [])
+        self.assertEqual(finalized.normal_text, "")
+        self.assertIsNone(detector._pending_tool_buffer)
+        self.assertEqual(detector.current_tool_id, 1)
+        self.assertEqual(len(detector.prev_tool_call_arr), 1)
+
+    def test_eof_releases_only_unconfirmed_tool_prefix(self):
+        detector = Glm47MoeDetector()
+        partial = detector.parse_streaming_increment("visible<tool_ca", self.tools)
+        self.assertEqual(partial.normal_text, "visible")
+
+        finalized = detector.finalize_streaming()
+
+        self.assertEqual(finalized.normal_text, "<tool_ca")
+        self.assertEqual(finalized.calls, [])
+        self.assertEqual(detector._buffer, "")
+
+    def test_many_tools_in_one_chunk_keep_one_input_object(self):
+        class CountingDetector(Glm47MoeDetector):
+            def __init__(self):
+                super().__init__()
+                self.append_inputs = []
+
+            def _append_pending_tool(self, text, cursor):
+                self.append_inputs.append(text)
+                return super()._append_pending_tool(text, cursor)
+
+        detector = CountingDetector()
+        text = "<tool_call>get_time</tool_call>" * 1024
+
+        result = detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1024)
+        self.assertEqual(
+            [call.tool_index for call in result.calls], list(range(1024))
+        )
+        self.assertTrue(
+            all(item is detector.append_inputs[0] for item in detector.append_inputs)
+        )
+        self.assertEqual(detector._buffer, "")
+
+
+class TestGlm47MoeDetectorUnknownTools(unittest.TestCase):
+    def setUp(self):
+        self.tools = create_basic_tools()
+        self.original_forward_unknown = os.environ.get(
+            "RTP_LLM_FORWARD_UNKNOWN_TOOLS"
+        )
+
+    def tearDown(self):
+        if self.original_forward_unknown is None:
+            os.environ.pop("RTP_LLM_FORWARD_UNKNOWN_TOOLS", None)
+        else:
+            os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = (
+                self.original_forward_unknown
+            )
+
+    def test_streaming_unknown_tool_is_dropped_by_default(self):
+        os.environ.pop("RTP_LLM_FORWARD_UNKNOWN_TOOLS", None)
+        text = (
+            "<tool_call>delete_everything<arg_key>scope</arg_key>"
+            "<arg_value>all</arg_value></tool_call>"
+            "<tool_call>get_time</tool_call>"
+        )
+        calls = []
+        detector = Glm47MoeDetector()
+        for chunk in list(text):
+            calls.extend(detector.parse_streaming_increment(chunk, self.tools).calls)
+
+        self.assertEqual([call.name for call in calls if call.name], ["get_time"])
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls if call.parameters)),
+            {},
+        )
+        self.assertEqual(detector._buffer, "")
+
+    def test_malformed_unknown_does_not_block_following_valid_tool(self):
+        os.environ.pop("RTP_LLM_FORWARD_UNKNOWN_TOOLS", None)
+        text = (
+            "<tool_call>unknown<arg_key>missing_value</arg_key></tool_call>"
+            "<tool_call>get_time</tool_call>"
+        )
+
+        stream = Glm47MoeDetector().parse_streaming_increment(text, self.tools)
+        non_stream = Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual([call.name for call in stream.calls], ["get_time"])
+        self.assertEqual([call.name for call in non_stream.calls], ["get_time"])
+
+    def test_malformed_empty_name_does_not_block_following_valid_tool(self):
+        os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = "true"
+        text = (
+            "<tool_call><arg_key>missing_value</arg_key></tool_call>"
+            "<tool_call>get_time</tool_call>"
+        )
+
+        stream = Glm47MoeDetector().parse_streaming_increment(text, self.tools)
+        non_stream = Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual([call.name for call in stream.calls], ["get_time"])
+        self.assertEqual([call.name for call in non_stream.calls], ["get_time"])
+
+    def test_forwarded_malformed_unknown_is_terminal(self):
+        os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = "true"
+        text = "<tool_call>unknown<arg_key>missing_value</arg_key></tool_call>"
+
+        # Default is lenient: streaming drops the malformed block instead of emitting a call.
+        stream = Glm47MoeDetector().parse_streaming_increment(text, self.tools)
+        self.assertEqual(stream.calls, [])
+
+        # Strict opt-in keeps streaming terminal.
+        with mock.patch.dict(os.environ, {"RTP_LLM_STRICT_TOOL_PARSING": "true"}):
+            with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+                Glm47MoeDetector().parse_streaming_increment(text, self.tools)
+
+        # Non-streaming parsing is always terminal.
+        with self.assertRaisesRegex(ToolParseError, "malformed tool arguments"):
+            Glm47MoeDetector().detect_and_parse(text, self.tools)
+
+    def test_streaming_unknown_tool_can_be_forwarded_explicitly(self):
+        os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = "true"
+        text = "<tool_call>custom_tool</tool_call>"
+        detector = Glm47MoeDetector()
+        result = detector.parse_streaming_increment(text, self.tools)
+
+        self.assertEqual([call.name for call in result.calls if call.name], ["custom_tool"])
+        self.assertEqual(
+            "".join(call.parameters for call in result.calls if call.parameters), "{}"
+        )
+
+    def test_forwarded_unknown_tool_preserves_following_tool_index(self):
+        os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = "true"
+        text = (
+            "<tool_call>custom_tool<arg_key>value</arg_key>"
+            "<arg_value>sample</arg_value></tool_call>"
+            "<tool_call>get_time</tool_call>"
+        )
+
+        detector = Glm47MoeDetector()
+        result = detector.parse_streaming_increment(text, self.tools)
+
+        name_calls = [call for call in result.calls if call.name]
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in name_calls],
+            [(0, "custom_tool"), (1, "get_time")],
+        )
+        merged = merge_tool_call_deltas(result.calls)
+        self.assertEqual(json.loads(merged[0]["parameters"]), {"value": "sample"})
+        self.assertEqual(json.loads(merged[1]["parameters"]), {})
+        self.assertEqual(detector._buffer, "")
+
+    def test_empty_tool_name_does_not_block_following_valid_tool(self):
+        os.environ["RTP_LLM_FORWARD_UNKNOWN_TOOLS"] = "true"
+        malformed = "<tool_call></tool_call>"
+        valid = "<tool_call>get_time</tool_call>"
+
+        detector = Glm47MoeDetector()
+        single_result = detector.parse_streaming_increment(malformed + valid, self.tools)
+        single_name_calls = [call for call in single_result.calls if call.name]
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in single_name_calls],
+            [(0, "get_time")],
+        )
+        self.assertEqual(
+            "".join(
+                call.parameters for call in single_result.calls if call.parameters
+            ),
+            "{}",
+        )
+        self.assertEqual(single_result.normal_text, "")
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.current_tool_id, 1)
+        self.assertEqual(len(detector.prev_tool_call_arr), 1)
+        self.assertEqual(len(detector.streamed_args_for_tool), 1)
+
+        detector = Glm47MoeDetector()
+        prefix_result = detector.parse_streaming_increment("<tool_call>", self.tools)
+        self.assertEqual(prefix_result.calls, [])
+        self.assertEqual(prefix_result.normal_text, "")
+        self.assertEqual(detector.current_tool_id, -1)
+        self.assertEqual(detector.prev_tool_call_arr, [])
+        self.assertEqual(detector.streamed_args_for_tool, [])
+
+        suffix_result = detector.parse_streaming_increment(
+            "</tool_call>" + valid, self.tools
+        )
+        suffix_name_calls = [call for call in suffix_result.calls if call.name]
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in suffix_name_calls],
+            [(0, "get_time")],
+        )
+        self.assertEqual(suffix_result.normal_text, "")
+        self.assertEqual(detector._buffer, "")
+        self.assertEqual(detector.current_tool_id, 1)
+        self.assertEqual(len(detector.prev_tool_call_arr), 1)
+        self.assertEqual(len(detector.streamed_args_for_tool), 1)
+
+        non_stream_result = Glm47MoeDetector().detect_and_parse(
+            malformed + valid, self.tools
+        )
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in non_stream_result.calls],
+            [(0, "get_time")],
+        )
+        self.assertEqual(non_stream_result.normal_text, "")
+
+
 
 def merge_tool_call_deltas(calls: list) -> dict:
     """
@@ -817,18 +1540,13 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
 
     def test_exact_values_simple_tool_call(self):
         """
-        Verify exact values for each chunk in a simple tool call.
+        Verify that a simple tool call is committed atomically.
 
         Input chunks and expected outputs:
         | Chunk                          | normal_text | calls                                           |
         |--------------------------------|-------------|-------------------------------------------------|
-        | <tool_call>get_weather<arg_key>| ""          | [name='get_weather'], [params='{']              |
-        | city</arg_key>                 | ""          | [params='"city"']                               |
-        | <arg_value>                    | ""          | [params=': ']                                   |
-        | 北                              | ""          | [params='"北']                                   |
-        | 京                              | ""          | [params='京']                                    |
-        | </arg_value>                   | ""          | [params='"']                                    |
-        | </tool_call>                   | ""          | [params='}']                                    |
+        | block before closing tag       | ""          | []                                              |
+        | </tool_call>                   | ""          | [name + complete canonical parameters]          |
 
         Merged: tool_index=0 -> {"name": "get_weather", "parameters": '{"city":"北京"}'}
         """
@@ -841,16 +1559,16 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
             (
                 "<tool_call>get_weather<arg_key>",
                 "",
-                1,  # Must emit at least name
-                lambda calls: any(c.name == "get_weather" for c in calls),
-                "Chunk 0: must emit name='get_weather'",
+                0,
+                None,
+                "Chunk 0: transaction remains private",
             ),
             (
                 "city</arg_key>",
                 "",
-                1,  # Must emit key
-                lambda calls: any('"city"' in c.parameters for c in calls),
-                "Chunk 1: must emit key 'city'",
+                0,
+                None,
+                "Chunk 1: transaction remains private",
             ),
             (
                 "<arg_value>",
@@ -883,9 +1601,13 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
             (
                 "</tool_call>",
                 "",
-                1,  # Must emit closing brace
-                lambda calls: any("}" in c.parameters for c in calls),
-                "Chunk 6: must emit closing brace",
+                1,
+                lambda calls: (
+                    len(calls) == 1
+                    and calls[0].name == "get_weather"
+                    and json.loads(calls[0].parameters) == {"city": "北京"}
+                ),
+                "Chunk 6: commit one complete tool call",
             ),
         ]
 
@@ -971,7 +1693,7 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
 
     def test_exact_values_multiple_args(self):
         """
-        Verify exact values for function with multiple arguments.
+        Verify atomic commit for a function with multiple arguments.
 
         Input chunks and expected outputs:
         | Chunk                                                          | calls contain          |
@@ -989,23 +1711,25 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
             (
                 "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo",
                 "",
-                lambda calls: (
-                    any(c.name == "get_weather" for c in calls)
-                    and any("city" in c.parameters for c in calls)
-                ),
-                "Chunk 0: should emit name and first arg key",
+                lambda calls: not calls,
+                "Chunk 0: transaction remains private",
             ),
             (
                 "</arg_value><arg_key>date</arg_key><arg_value>2024-01-01",
                 "",
-                lambda calls: any("date" in c.parameters for c in calls),
-                "Chunk 1: should emit second arg key-value",
+                lambda calls: not calls,
+                "Chunk 1: transaction remains private",
             ),
             (
                 "</arg_value></tool_call>",
                 "",
-                lambda calls: len(calls) >= 1,
-                "Chunk 2: should finalize",
+                lambda calls: (
+                    len(calls) == 1
+                    and calls[0].name == "get_weather"
+                    and json.loads(calls[0].parameters)
+                    == {"city": "Tokyo", "date": "2024-01-01"}
+                ),
+                "Chunk 2: should commit once",
             ),
         ]
 
@@ -1186,21 +1910,16 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
 
     def test_exact_values_character_by_character_value(self):
         """
-        Verify character-by-character streaming of argument values.
-
-        Each character of the value should produce an increment.
+        Verify character-by-character input remains private until commit.
         """
         detector = Glm47MoeDetector()
 
-        # Set up: emit name first
+        # Set up an incomplete transaction.
         result0 = detector.parse_streaming_increment(
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>", self.tools
         )
 
-        # Verify name was emitted
-        name_calls = [c for c in result0.calls if c.name]
-        self.assertEqual(len(name_calls), 1)
-        self.assertEqual(name_calls[0].name, "get_weather")
+        self.assertEqual(result0.calls, [])
 
         # Now stream value character by character
         chars = ["A", "B", "C"]
@@ -1209,18 +1928,13 @@ class TestGlm47MoeDetectorExactIncrementalValues(unittest.TestCase):
             result = detector.parse_streaming_increment(char, self.tools)
             char_results.append(result)
 
-            # Each character should produce a call with that character in params
-            if result.calls:
-                # The character should be in the parameters
-                params = result.calls[0].parameters
-                self.assertIn(
-                    char, params, f"Expected '{char}' in params. Got: '{params}'"
-                )
+            self.assertEqual(result.calls, [])
 
         # Finalize
         result_end = detector.parse_streaming_increment(
             "</arg_value></tool_call>", self.tools
         )
+        self.assertEqual(len(result_end.calls), 1)
 
         # Aggregate all arguments
         all_calls = list(result0.calls)

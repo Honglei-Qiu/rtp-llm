@@ -93,10 +93,11 @@ def _register_builtin_lazy_renderers() -> None:
         ["chatglm4", "chatglm4v"], "rtp_llm.openai.renderers.chatglm4_renderer"
     )
     register_lazy_renderer(
-        ["glm4_moe", "glm_5"], "rtp_llm.openai.renderers.chatglm45_renderer"
+        ["glm4_moe"], "rtp_llm.openai.renderers.chatglm45_renderer"
     )
     register_lazy_renderer(
-        ["glm47_moe", "glm4_moe_lite"], "rtp_llm.openai.renderers.chatglm47_renderer"
+        ["glm47_moe", "glm4_moe_lite", "glm_5"],
+        "rtp_llm.openai.renderers.chatglm47_renderer",
     )
     register_lazy_renderer(
         ["deepseek_vl_v2"], "rtp_llm.openai.renderers.deepseek_vl2_renderer"

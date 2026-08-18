@@ -23,9 +23,19 @@ from rtp_llm.openai.renderers.sglang_helpers.function_call.utils import (
 logger = logging.getLogger(__name__)
 
 
+class ToolParseError(Exception):
+    """A tool block was recognized but could not be parsed atomically."""
+
+
 def _forward_unknown_tools() -> bool:
     """Check if unknown tool calls should be forwarded instead of dropped."""
     return os.environ.get("RTP_LLM_FORWARD_UNKNOWN_TOOLS", "").lower() == "true"
+
+
+def _strict_tool_parsing() -> bool:
+    """When off (default), a malformed streaming tool block is dropped and parsing recovers
+    rather than aborting the whole request mid-stream; when on, the parse error propagates."""
+    return os.environ.get("RTP_LLM_STRICT_TOOL_PARSING", "").lower() == "true"
 
 
 class BaseFormatDetector(ABC):
@@ -89,7 +99,10 @@ class BaseFormatDetector(ABC):
         results = []
         for i, act in enumerate(action):
             name = act.get("name")
-            if not (name and name in tool_indices):
+            if not name:
+                logger.warning("Model attempted to call a function with an empty name")
+                continue
+            if name not in tool_indices:
                 logger.warning(f"Model attempted to call undefined function: {name}")
                 if not _forward_unknown_tools():
                     continue
@@ -115,6 +128,16 @@ class BaseFormatDetector(ABC):
         """
         action = orjson.loads(text)
         return StreamingParseResult(calls=self.parse_base_json(action, tools))
+
+    def detect_and_parse_with_context(
+        self, text: str, tools: List[Tool], truncated: bool = False
+    ) -> StreamingParseResult:
+        """Parse a final aggregate while preserving legacy detector signatures."""
+        return self.detect_and_parse(text, tools)
+
+    def finalize_streaming(self, truncated: bool = False) -> StreamingParseResult:
+        """Finalize detector-owned streaming state at the end of generation."""
+        return StreamingParseResult()
 
     def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
         """

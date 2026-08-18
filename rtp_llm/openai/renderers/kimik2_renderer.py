@@ -6,6 +6,7 @@ from typing_extensions import override
 
 from rtp_llm.openai.api_datatype import (
     ChatCompletionRequest,
+    FinisheReason,
     GPTToolDefinition,
     ToolCall,
 )
@@ -153,6 +154,7 @@ class KimiK2Renderer(ReasoningToolBaseRenderer):
         tools: Optional[List[GPTToolDefinition]],
         text: str,
         is_streaming: bool,
+        finish_reason: Optional[FinisheReason] = None,
     ) -> tuple[Optional[List[ToolCall]], str]:
         """
         支持kimi_k2的tool_call_id类似于functions.get_current_weather:1这样的返回结果
@@ -172,7 +174,11 @@ class KimiK2Renderer(ReasoningToolBaseRenderer):
             else:
                 # 兼容kimik2在非流式的情况下可能返回结果中有以<|im_end|>的结果
                 cleaned_text = self._clean_stop_words(text)
-                parse_result = detector.detect_and_parse(cleaned_text, sglang_tools)
+                parse_result = detector.detect_and_parse_with_context(
+                    cleaned_text,
+                    sglang_tools,
+                    truncated=finish_reason == FinisheReason.length,
+                )
 
             # 有工具调用时，使用格式转换函数
             tool_calls, remaining_text = streaming_parse_result_to_tool_calls(
