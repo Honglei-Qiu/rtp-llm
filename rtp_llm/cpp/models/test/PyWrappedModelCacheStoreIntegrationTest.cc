@@ -344,6 +344,46 @@ protected:
     }
 };
 
+struct GraphCallCounters {
+    int can_run{0};
+    int prepare{0};
+    int forward{0};
+};
+
+class TestGraphRunner: public GraphBase {
+public:
+    explicit TestGraphRunner(std::shared_ptr<GraphCallCounters> counters):
+        GraphBase(py::none()), counters_(std::move(counters)) {}
+
+    void initCapture() override {}
+
+    PyModelOutputs forward(const PyModelInputs& inputs, CudaGraphState&) override {
+        RTP_LLM_CHECK_WITH_INFO(prepared_, "test graph forward requires prepared attention inputs");
+        ++counters_->forward;
+        prepared_ = false;
+        return PyModelOutputs(torch::zeros(
+            {inputs.input_ids.size(0), 1}, inputs.input_ids.options().dtype(torch::kFloat16)));
+    }
+
+    void setPositionEncoding(torch::Tensor) override {}
+    void setTokenTypeEmbedding(torch::Tensor) override {}
+    void setInputEmbeddingScalar(float) override {}
+
+    bool canRun(const PyModelInputs&, CudaGraphState&) override {
+        ++counters_->can_run;
+        return true;
+    }
+
+    void prepareAttentionInputs(const PyModelInputs&, CudaGraphState&, bool) override {
+        ++counters_->prepare;
+        prepared_ = true;
+    }
+
+private:
+    std::shared_ptr<GraphCallCounters> counters_;
+    bool                               prepared_{false};
+};
+
 struct Scenario {
     CacheConfig                      manager_config;
     GroupedCacheLayerLayout          layout;
@@ -354,6 +394,9 @@ struct Scenario {
     size_t                           model_id{0};
     std::optional<int>               mtp_cache_config_index;
     bool                             replace_cp_processor{false};
+    bool                             use_mla{false};
+    bool                             exercise_cuda_graph_boundary{false};
+    std::vector<GptModelInputs>      followup_inputs;
 };
 
 Scenario makeMultiTagScenario() {
@@ -385,7 +428,8 @@ Scenario makeMicroBatchScenario() {
                              /*block_table_width=*/2,
                              /*global_tokens_per_block=*/2,
                              /*global_stride_bytes=*/16);
-    Scenario scenario{std::move(config), std::move(layout.layout), std::move(layout.base_addresses), std::move(inputs)};
+    Scenario scenario{
+        std::move(config), std::move(layout.layout), std::move(layout.base_addresses), std::move(inputs)};
     scenario.device_resources.enable_layer_micro_batch = static_cast<int>(MicroBatchType::DS_PREFILL);
     return scenario;
 }
@@ -408,6 +452,64 @@ Scenario makeContextParallelScenario() {
     scenario.parallelism.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
     scenario.parallelism.prefill_cp_config.kv_cache_sharded = true;
     scenario.replace_cp_processor                           = true;
+    return scenario;
+}
+
+Scenario makeContextParallelRoutingScenario() {
+    auto config = makeCacheConfig({{"full", 2, 16}, {"linear", 2, 16}});
+    auto layout = makeLayout(config);
+    auto inputs = makeInputs(/*input_lengths=*/{6},
+                             /*request_ids=*/{301},
+                             /*cache_keys=*/{3101, 3102, 3103, 3104, 3105, 3106},
+                             /*cache_keys_width=*/6,
+                             /*block_ids=*/{1, 2, 3, 4, 5, 6},
+                             /*group_count=*/2,
+                             /*block_table_width=*/3,
+                             /*global_tokens_per_block=*/2,
+                             /*global_stride_bytes=*/16);
+    inputs.pd_separation = false;
+    Scenario scenario{std::move(config), std::move(layout.layout), std::move(layout.base_addresses), std::move(inputs)};
+    scenario.parallelism.tp_size                            = 2;
+    scenario.parallelism.tp_rank                            = 1;
+    scenario.parallelism.prefill_cp_config.method           = CPRotateMethod::ALL_GATHER;
+    scenario.parallelism.prefill_cp_config.kv_cache_sharded = true;
+    scenario.replace_cp_processor                           = true;
+    scenario.use_mla                                        = true;
+
+    auto target_verify = makeInputs(/*input_lengths=*/{3},
+                                    /*request_ids=*/{302},
+                                    /*cache_keys=*/{3201, 3202, 3203},
+                                    /*cache_keys_width=*/3,
+                                    /*block_ids=*/{1, 2, 3, 4},
+                                    /*group_count=*/2,
+                                    /*block_table_width=*/2,
+                                    /*global_tokens_per_block=*/2,
+                                    /*global_stride_bytes=*/16);
+    target_verify.pd_separation    = false;
+    target_verify.is_target_verify = true;
+
+    auto decode = makeInputs(/*input_lengths=*/{1},
+                             /*request_ids=*/{303},
+                             /*cache_keys=*/{3301},
+                             /*cache_keys_width=*/1,
+                             /*block_ids=*/{1, 2, 3, 4, 5, 6},
+                             /*group_count=*/2,
+                             /*block_table_width=*/3,
+                             /*global_tokens_per_block=*/2,
+                             /*global_stride_bytes=*/16);
+    decode.pd_separation    = false;
+    decode.prefix_lengths   = pinnedTensor({}, {0});
+    decode.sequence_lengths = pinnedTensor({6}, {1});
+
+    scenario.followup_inputs.push_back(std::move(target_verify));
+    scenario.followup_inputs.push_back(std::move(decode));
+    return scenario;
+}
+
+Scenario makeContextParallelGraphRoutingScenario() {
+    auto scenario = makeContextParallelRoutingScenario();
+    scenario.exercise_cuda_graph_boundary = true;
+    scenario.followup_inputs.erase(scenario.followup_inputs.begin());
     return scenario;
 }
 
@@ -441,6 +543,12 @@ Scenario makeScenario(const std::string& name) {
     }
     if (name == "cp_actual_lengths") {
         return makeContextParallelScenario();
+    }
+    if (name == "cp_request_routing") {
+        return makeContextParallelRoutingScenario();
+    }
+    if (name == "cp_graph_routing") {
+        return makeContextParallelGraphRoutingScenario();
     }
     if (name == "mtp_sub_config") {
         return makeMtpScenario();
@@ -510,6 +618,7 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::str
     description.attention_conf.head_num      = 1;
     description.attention_conf.kv_head_num   = 1;
     description.attention_conf.size_per_head = 1;
+    description.attention_conf.use_mla       = scenario.use_mla;
 
     const auto&        active_config = scenario.mtp_cache_config_index.has_value() ?
                                            manager->getMTPModuleCacheConfig(*scenario.mtp_cache_config_index) :
@@ -533,14 +642,32 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::str
                               manager,
                               scenario.mtp_cache_config_index};
 
+    auto graph_counters = std::make_shared<GraphCallCounters>();
     {
         PyWrappedModel model(params, std::move(py_model));
         if (scenario.replace_cp_processor) {
             model.context_parallel_processor_ = std::make_unique<TestContextParallelProcessor>(scenario.parallelism);
         }
+        if (scenario.exercise_cuda_graph_boundary) {
+            model.enable_cuda_graph_ = true;
+            model.graph_runner_      = new TestGraphRunner(graph_counters);
+            model.prepareAttentionInputs(scenario.inputs);
+        }
         (void)model.forward(scenario.inputs);
+        for (const auto& followup_input : scenario.followup_inputs) {
+            if (scenario.exercise_cuda_graph_boundary) {
+                model.prepareAttentionInputs(followup_input);
+            }
+            (void)model.forward(followup_input);
+        }
     }
-    return serializeResult(*cache_store, scenario.base_addresses);
+    auto result = serializeResult(*cache_store, scenario.base_addresses);
+    if (scenario.exercise_cuda_graph_boundary) {
+        result["graph_can_run_calls"] = graph_counters->can_run;
+        result["graph_prepare_calls"] = graph_counters->prepare;
+        result["graph_forward_calls"] = graph_counters->forward;
+    }
+    return result;
 }
 
 }  // namespace

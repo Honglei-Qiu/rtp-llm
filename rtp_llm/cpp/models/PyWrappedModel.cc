@@ -654,11 +654,23 @@ torch_ext::PyMultimodalInputs PyWrappedModel::buildPyMultimodalInputs(const GptM
     return multimodal_input;
 }
 
+bool PyWrappedModel::shouldRunRequestLevelMlaCp(const GptModelInputs& inputs) const {
+    return description_.attention_conf.use_mla && device_props_.enable_prefill_cp && !inputs.is_target_verify
+           && inputs.sequence_lengths.size(0) == 0 && inputs.input_lengths.size(0) > 0;
+}
+
 void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs) {
-    prepareAttentionInputs(inputs, false);
+    prepareAttentionInputsImpl(inputs, false, nullptr);
 }
 
 void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync) {
+    prepareAttentionInputsImpl(inputs, skip_forward_event_sync, nullptr);
+}
+
+void PyWrappedModel::prepareAttentionInputsImpl(
+    const GptModelInputs& inputs,
+    bool skip_forward_event_sync,
+    const torch_ext::PyContextParallelParams* context_parallel_params) {
     RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs");
     d2d_copies_.clear();
     if (pinned_check_remaining_ > 0) {
@@ -675,6 +687,15 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
         attention_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
         if (attention_inputs.cache_store_inputs.has_value()) {
             attention_inputs.cache_store_writer = cache_store_async_writer_;
+        }
+    }
+    if (context_parallel_params != nullptr) {
+        attention_inputs.context_parallel_info = *context_parallel_params;
+        if (attention_inputs.cache_store_inputs.has_value()) {
+            // CP rewrites input_lengths to the rank-local chunk, while cache
+            // publication must retain the full pre-sharding request lengths.
+            attention_inputs.cache_store_inputs->input_lengths_host =
+                context_parallel_params->prefill_actual_input_lengths_cpu;
         }
     }
     {
@@ -715,7 +736,9 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
     // DSpARK proposal and commit are both prefill-shaped; only the explicit
     // phase distinguishes them for capture/replay selection.
     py_model_inputs.dspark_call_phase = inputs.dspark_call_phase;
-    if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+    const bool request_level_mla_cp =
+        context_parallel_params != nullptr || shouldRunRequestLevelMlaCp(inputs);
+    if (!request_level_mla_cp && enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
         RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
         graph_runner_->prepareAttentionInputs(py_model_inputs, graph_state_, skip_forward_event_sync);
     }
@@ -769,55 +792,67 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         if (int(device_props_.enable_layer_micro_batch)) {
             return forwardMicroBatched(inputs);
         }
+        const bool has_context_request = inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
+        const bool run_request_level_mla_cp = shouldRunRequestLevelMlaCp(inputs);
+        const bool run_global_mha_cp = !description_.attention_conf.use_mla && device_props_.enable_prefill_cp;
         PyContextParallelParams cp_params;
-        const bool              has_context_request = inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
-        if (device_props_.enable_prefill_cp && has_context_request) {
-            // CP accepts pure-prefill batches without MTP/speculative hidden states;
-            // handleInputs enforces both constraints before mutating the batch.
+        GptModelInputs          cp_inputs;
+        const GptModelInputs*   forward_inputs = &inputs;
+        if (run_request_level_mla_cp) {
+            cp_inputs               = inputs;
+            cp_inputs.input_lengths = inputs.input_lengths.clone();
+            if (!cp_inputs.input_lengths.device().is_cuda()) {
+                cp_inputs.input_lengths = cp_inputs.input_lengths.pin_memory();
+            }
+            context_parallel_processor_->handleInputs(cp_inputs, cp_params);
+            forward_inputs = &cp_inputs;
+        } else if (run_global_mha_cp && has_context_request) {
+            // Preserve the existing MHA context-parallel contract. Only MLA
+            // selects context parallelism from request-local attention metadata.
             context_parallel_processor_->handleInputs(const_cast<GptModelInputs&>(inputs), cp_params);
         }
+        const GptModelInputs& model_inputs = *forward_inputs;
 
         torch::Tensor token_ids;
-        if (inputs.combo_tokens.device().is_cuda()) {
-            token_ids = inputs.combo_tokens;
+        if (model_inputs.combo_tokens.device().is_cuda()) {
+            token_ids = model_inputs.combo_tokens;
         } else {
-            buffer_holder_.hold_host(inputs.combo_tokens);
-            token_ids = inputs.combo_tokens.to(torch::kCUDA, /*non_blocking=*/true);
+            buffer_holder_.hold_host(model_inputs.combo_tokens);
+            token_ids = model_inputs.combo_tokens.to(torch::kCUDA, /*non_blocking=*/true);
         }
 
         torch::Tensor input_hiddens =
-            inputs.last_hidden_states.defined() ? inputs.last_hidden_states : torch::empty({0});
+            model_inputs.last_hidden_states.defined() ? model_inputs.last_hidden_states : torch::empty({0});
 
         torch::Tensor combo_position_ids = torch::empty({0});
-        if (inputs.combo_position_ids.defined()) {
-            if (inputs.combo_position_ids.device().is_cuda()) {
-                combo_position_ids = inputs.combo_position_ids;
+        if (model_inputs.combo_position_ids.defined()) {
+            if (model_inputs.combo_position_ids.device().is_cuda()) {
+                combo_position_ids = model_inputs.combo_position_ids;
             } else {
-                buffer_holder_.hold_host(inputs.combo_position_ids);
-                combo_position_ids = inputs.combo_position_ids.to(torch::kCUDA, /*non_blocking=*/true);
+                buffer_holder_.hold_host(model_inputs.combo_position_ids);
+                combo_position_ids = model_inputs.combo_position_ids.to(torch::kCUDA, /*non_blocking=*/true);
             }
         }
 
-        auto embedding_inputs      = buildPyEmbeddingInputs(inputs);
-        auto multimodal_inputs     = buildPyMultimodalInputs(inputs);
-        auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
-        if (!prepared_attention_inputs_.load(std::memory_order_acquire)) {
-            prepareAttentionInputs(inputs, /*skip_forward_event_sync=*/true);
+        auto embedding_inputs      = buildPyEmbeddingInputs(model_inputs);
+        auto multimodal_inputs     = buildPyMultimodalInputs(model_inputs);
+        auto bert_embedding_inputs = buildBertEmbeddingInputs(model_inputs);
+        if (run_request_level_mla_cp || !prepared_attention_inputs_.load(std::memory_order_acquire)) {
+            // An asynchronously prepared input still reflects the unsharded request.
+            // Rebuild it from this request's rank-local CP copy before exposing it to Python.
+            prepareAttentionInputsImpl(
+                model_inputs, /*skip_forward_event_sync=*/true, run_request_level_mla_cp ? &cp_params : nullptr);
         }
-        if (device_props_.enable_prefill_cp && has_context_request) {
+        if (run_global_mha_cp && has_context_request) {
             attention_inputs_.context_parallel_info = cp_params;
             for (auto& [tag, tagged_inputs] : attention_inputs_by_tag_) {
                 tagged_inputs.context_parallel_info = cp_params;
             }
+            if (attention_inputs_.cache_store_inputs.has_value()) {
+                attention_inputs_.cache_store_inputs->input_lengths_host = cp_params.prefill_actual_input_lengths_cpu;
+            }
         }
-
-        if (device_props_.enable_prefill_cp && has_context_request
-            && attention_inputs_.cache_store_inputs.has_value()) {
-            // ContextParallelProcessor rewrites input_lengths to the rank-local
-            // chunk; cache-store planning must keep the full pre-sharding lengths.
-            attention_inputs_.cache_store_inputs->input_lengths_host = cp_params.prefill_actual_input_lengths_cpu;
-        }
-        const bool                has_cache_store_work = !inputs.warmup && inputs.pd_separation;
+        const bool                has_cache_store_work = !model_inputs.warmup && model_inputs.pd_separation;
         CacheStoreWriteCycleGuard cache_store_write_cycle(cache_store_async_writer_, has_cache_store_work);
 
         auto           py_model_inputs = PyModelInputs({token_ids,
@@ -833,7 +868,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         torch::Tensor  hidden_states;
 
         // Cast the Python object to PyModelOutputs and extract hidden states
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+        if (!run_request_level_mla_cp && enable_cuda_graph_
+            && graph_runner_->canRun(py_model_inputs, graph_state_)) {
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
@@ -880,7 +916,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             outputs.all_hidden_states = hidden_states;
             return attach_draft_outputs(std::move(outputs));
         }
-        if (device_props_.enable_prefill_cp && has_context_request) {
+        if (run_request_level_mla_cp || (run_global_mha_cp && has_context_request)) {
             if (!inputs.need_all_logits && !inputs.need_all_hidden_states) {
                 context_parallel_processor_->handleOutputsLastHidden(hidden_states, inputs, cp_params);
                 return attach_draft_outputs(forwardPostLayersLastHidden(hidden_states, inputs));

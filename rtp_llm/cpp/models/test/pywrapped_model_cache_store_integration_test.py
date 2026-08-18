@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -7,6 +9,36 @@ from rtp_llm.cpp.models.test.libth_pywrapped_model_cache_store_integration_test 
     PyModelOutputs,
     run_scenario,
 )
+from rtp_llm.models_py.modules.factory.attention import attn_factory
+from rtp_llm.models_py.modules.hybrid.indexer import Indexer
+
+
+class _SparseMlaImpl:
+    @staticmethod
+    def support(attn_configs, attn_inputs) -> bool:
+        return True
+
+    @staticmethod
+    def is_sparse() -> bool:
+        return True
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+
+class _RequestLocalMlaImpl(_SparseMlaImpl):
+    @classmethod
+    def support_parallelism_config(cls, parallelism_config) -> bool:
+        return False
+
+
+class _ContextParallelMlaImpl(_SparseMlaImpl):
+    @classmethod
+    def support_parallelism_config(cls, parallelism_config) -> bool:
+        return True
 
 
 class CacheStoreForwardModel:
@@ -27,11 +59,12 @@ class CacheStoreForwardModel:
 
     def _forward_one(self, inputs: PyModelInputs) -> PyModelOutputs:
         attention_inputs = inputs.attention_inputs
-        first_inputs = (
-            next(iter(attention_inputs.values()))
+        request_inputs = (
+            list(attention_inputs.values())
             if isinstance(attention_inputs, dict)
-            else attention_inputs
+            else [attention_inputs]
         )
+        first_inputs = request_inputs[0]
         self.seen_input_lengths.append(first_inputs.input_lengths.tolist())
 
         assert self.kv_cache is not None
@@ -65,6 +98,71 @@ class CacheStoreForwardModel:
         return [self._forward_one(model_inputs) for model_inputs in inputs]
 
 
+class ContextParallelRoutingModel(CacheStoreForwardModel):
+    def __init__(self) -> None:
+        super().__init__()
+        attention_config = SimpleNamespace(
+            indexer_topk=0,
+            is_sparse=True,
+            use_mla=True,
+        )
+        self.model_config = SimpleNamespace(
+            getAttentionConfigs=lambda _tp_size: attention_config,
+            max_seq_len=64,
+            quant_config=None,
+        )
+        self.parallelism_config = SimpleNamespace(
+            get_attn_tp_size=lambda: 1,
+            prefill_cp_config=SimpleNamespace(is_enabled=lambda: True),
+        )
+        self.weights = SimpleNamespace(
+            weights=[],
+            get_global_weight_or_none=lambda _name: None,
+        )
+        self.routing: list[tuple[str, type, bool, bool]] = []
+
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False):
+        attention_inputs = inputs.attention_inputs
+        request_inputs = (
+            list(attention_inputs.values())
+            if isinstance(attention_inputs, dict)
+            else [attention_inputs]
+        )
+        first_inputs = request_inputs[0]
+        with patch.object(
+            attn_factory,
+            "PREFILL_MLA_IMPS",
+            [_RequestLocalMlaImpl, _ContextParallelMlaImpl],
+        ), patch.object(
+            attn_factory,
+            "DECODE_MLA_IMPS",
+            [_RequestLocalMlaImpl, _ContextParallelMlaImpl],
+        ):
+            selected = attn_factory.AttnImplFactory.get_fmha_impl(
+                self.model_config,
+                self.parallelism_config,
+                self.weights,
+                first_inputs,
+                is_cuda_graph=is_cuda_graph,
+            )
+
+        if first_inputs.is_target_verify:
+            request_kind = "target_verify"
+        elif first_inputs.is_prefill:
+            request_kind = "prefill"
+        else:
+            request_kind = "decode"
+        self.routing.append(
+            (
+                request_kind,
+                type(selected),
+                all(item.context_parallel_info is not None for item in request_inputs),
+                Indexer._is_sparse_prefill_cp(first_inputs),
+            )
+        )
+        return selected
+
+
 def _blocks_by_key(result: dict) -> dict[str, dict]:
     return {
         block["key"]: block
@@ -87,6 +185,35 @@ def _record_for_request(result: dict, request_id: int) -> dict:
 
 
 class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
+    def test_context_parallel_async_prepare_does_not_leak_into_next_graph_request(
+        self,
+    ) -> None:
+        model = ContextParallelRoutingModel()
+        result = run_scenario(model, "cp_graph_routing")
+
+        self.assertEqual(model.seen_input_lengths, [[4]])
+        self.assertEqual(
+            model.routing,
+            [("prefill", _ContextParallelMlaImpl, True, True)],
+        )
+        self.assertEqual(result["graph_can_run_calls"], 2)
+        self.assertEqual(result["graph_prepare_calls"], 1)
+        self.assertEqual(result["graph_forward_calls"], 1)
+
+    def test_context_parallel_routing_is_request_local_across_cpp_pybind(self) -> None:
+        model = ContextParallelRoutingModel()
+        run_scenario(model, "cp_request_routing")
+
+        self.assertEqual(model.seen_input_lengths, [[4], [3], [1]])
+        self.assertEqual(
+            model.routing,
+            [
+                ("prefill", _ContextParallelMlaImpl, True, True),
+                ("target_verify", _RequestLocalMlaImpl, False, False),
+                ("decode", _RequestLocalMlaImpl, False, False),
+            ],
+        )
+
     def test_multi_tag_uses_each_tag_local_physical_block_table(self) -> None:
         model = CacheStoreForwardModel()
         result = run_scenario(model, "multi_tag")
