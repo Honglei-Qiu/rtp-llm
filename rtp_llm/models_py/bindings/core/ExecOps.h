@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 
 #if USING_ROCM
@@ -64,7 +65,11 @@ void cudaProfilerEnd();
 
 ExecStatus    getGpuExecStatus();
 torch::Device getTorchCudaDevice();
-void          setTraceMemory(bool trace_memory);
+using MemoryTraceToken = uint64_t;
+MemoryTraceToken startMemoryTrace();
+void             stopMemoryTrace(MemoryTraceToken token);
+void             setTraceMemory(bool trace_memory);
+bool             isTraceMemoryEnabled();
 
 // ===================================================================
 // Copy ops

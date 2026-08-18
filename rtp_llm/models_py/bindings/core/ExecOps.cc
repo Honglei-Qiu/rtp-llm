@@ -27,6 +27,7 @@
 #include <utility>
 #if USING_CUDA
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #elif USING_ROCM
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #endif
@@ -75,6 +76,26 @@ static std::once_flag    g_init_flag;
 static bool g_enable_comm_overlap = true;
 
 static int64_t g_device_id = 0;
+
+#if USING_CUDA
+struct MemoryTraceState {
+    bool             active{false};
+    MemoryTraceToken token{0};
+    c10::DeviceIndex device_id{0};
+    int64_t          baseline_allocated_bytes{0};
+    int64_t          baseline_reserved_bytes{0};
+};
+
+static std::mutex       g_memory_trace_mutex;
+static MemoryTraceState g_memory_trace_state;
+static MemoryTraceToken g_next_memory_trace_token{1};
+static std::mutex       g_legacy_memory_trace_mutex;
+static MemoryTraceToken g_legacy_memory_trace_token{0};
+
+size_t positiveDelta(int64_t value, int64_t baseline) {
+    return value > baseline ? static_cast<size_t>(value - baseline) : 0;
+}
+#endif
 }  // anonymous namespace
 
 // ============================================================
@@ -536,6 +557,17 @@ ExecStatus getGpuExecStatus() {
 #if USING_CUDA
     auto error = cudaMemGetInfo(&mem.free_bytes, &total_bytes);
     RTP_LLM_CHECK(error == cudaSuccess);
+
+    std::lock_guard<std::mutex> lock(g_memory_trace_mutex);
+    if (g_memory_trace_state.active) {
+        const auto allocator_stats =
+            c10::cuda::CUDACachingAllocator::getDeviceStats(g_memory_trace_state.device_id);
+        const auto allocated_peak = positiveDelta(allocator_stats.allocated_bytes[0].peak,
+                                                  g_memory_trace_state.baseline_allocated_bytes);
+        const auto reserved_peak  = positiveDelta(allocator_stats.reserved_bytes[0].peak,
+                                                 g_memory_trace_state.baseline_reserved_bytes);
+        mem.max_consumed_bytes    = std::max(allocated_peak, reserved_peak);
+    }
 #elif USING_ROCM
     hipMemGetInfo(&mem.free_bytes, &total_bytes);
 #endif
@@ -550,12 +582,64 @@ torch::Device getTorchCudaDevice() {
     return torch::Device(torch::kCUDA);
 }
 
-namespace {
-static bool g_trace_memory = false;
+MemoryTraceToken startMemoryTrace() {
+#if USING_CUDA
+    std::lock_guard<std::mutex> lock(g_memory_trace_mutex);
+    RTP_LLM_CHECK_WITH_INFO(!g_memory_trace_state.active, "memory tracing is already owned by another operation");
+
+    MemoryTraceToken token = g_next_memory_trace_token++;
+    if (token == 0) {
+        token = g_next_memory_trace_token++;
+    }
+
+    const auto device_id = static_cast<c10::DeviceIndex>(g_device_id);
+    const auto stats     = c10::cuda::CUDACachingAllocator::getDeviceStats(device_id);
+    c10::cuda::CUDACachingAllocator::resetPeakStats(device_id);
+    g_memory_trace_state =
+        {true, token, device_id, stats.allocated_bytes[0].current, stats.reserved_bytes[0].current};
+    return token;
+#else
+    return 0;
+#endif
+}
+
+void stopMemoryTrace(MemoryTraceToken token) {
+#if USING_CUDA
+    std::lock_guard<std::mutex> lock(g_memory_trace_mutex);
+    RTP_LLM_CHECK_WITH_INFO(g_memory_trace_state.active, "memory tracing is not active");
+    RTP_LLM_CHECK_WITH_INFO(g_memory_trace_state.token == token,
+                            "memory tracing token does not own the active trace");
+    g_memory_trace_state = {};
+#else
+    (void)token;
+#endif
 }
 
 void setTraceMemory(bool trace_memory) {
-    g_trace_memory = trace_memory;
+#if USING_CUDA
+    std::lock_guard<std::mutex> legacy_lock(g_legacy_memory_trace_mutex);
+    if (trace_memory) {
+        if (g_legacy_memory_trace_token == 0) {
+            g_legacy_memory_trace_token = startMemoryTrace();
+        }
+        return;
+    }
+    if (g_legacy_memory_trace_token != 0) {
+        stopMemoryTrace(g_legacy_memory_trace_token);
+        g_legacy_memory_trace_token = 0;
+    }
+#else
+    (void)trace_memory;
+#endif
+}
+
+bool isTraceMemoryEnabled() {
+#if USING_CUDA
+    std::lock_guard<std::mutex> lock(g_memory_trace_mutex);
+    return g_memory_trace_state.active;
+#else
+    return false;
+#endif
 }
 
 // === Copy ops ===

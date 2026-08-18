@@ -30,6 +30,14 @@ cc_test(
     tags = ["manual"],
 )
 
+cc_test(
+    name = "exec_ops_memory_trace_test",
+    srcs = ["ExecOpsMemoryTraceTest.cc"],
+    deps = exec_ops_test_deps,
+    copts = test_copts,
+    tags = ["manual"],
+)
+
 # Run focused cache-store coverage in default wildcard test gates while keeping
 # the broader GPU-linked ExecOps suite manual.
 cc_test(

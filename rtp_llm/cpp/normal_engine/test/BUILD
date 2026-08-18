@@ -95,6 +95,22 @@ cc_test(
 )
 
 cc_test(
+    name = "warm_up_resource_cleanup_test",
+    srcs = ["NormalEngineWarmUpResourceCleanupTest.cc"],
+    copts = test_copts,
+    deps = [
+        ":mock_engine",
+        "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {'gpu':'H20'},
+)
+
+cc_test(
     name = "async_runner_test",
     srcs = [
         "AsyncRunnerTest.cc",

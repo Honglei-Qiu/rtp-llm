@@ -83,6 +83,93 @@ bool shouldRefreshCacheStatusSnapshot(RoleType role_type, const std::list<Genera
         return stream && !stream->isFakeStream() && stream->isContextStream();
     });
 }
+
+class MemoryTraceScope {
+public:
+    MemoryTraceScope() = default;
+
+    void start() {
+        if (!active_) {
+            token_  = rtp_llm::startMemoryTrace();
+            active_ = true;
+        }
+    }
+
+    void stop() {
+        if (active_) {
+            rtp_llm::stopMemoryTrace(token_);
+            active_ = false;
+            token_  = 0;
+        }
+    }
+
+    ~MemoryTraceScope() noexcept {
+        try {
+            stop();
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("failed to stop warmup memory tracing: %s", e.what());
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("failed to stop warmup memory tracing with an unknown error");
+        }
+    }
+
+    MemoryTraceScope(const MemoryTraceScope&)            = delete;
+    MemoryTraceScope& operator=(const MemoryTraceScope&) = delete;
+
+private:
+    rtp_llm::MemoryTraceToken token_  = 0;
+    bool                      active_ = false;
+};
+
+#if USING_CUDA
+class WarmUpResourceScope {
+public:
+    WarmUpResourceScope(std::unique_ptr<Executor>& executor, std::shared_ptr<KVCacheManager>& cache_manager):
+        executor_(executor), cache_manager_(cache_manager) {}
+
+    void startTrace() {
+        trace_scope_.start();
+        started_ = true;
+    }
+
+    void cleanup() {
+        if (!started_ || cleaned_) {
+            return;
+        }
+        executor_.reset();
+        cache_manager_.reset();
+        trace_scope_.stop();
+        c10::cuda::CUDACachingAllocator::emptyCache();
+        cleaned_ = true;
+    }
+
+    ~WarmUpResourceScope() noexcept {
+        if (!started_ || cleaned_) {
+            return;
+        }
+        try {
+            executor_.reset();
+            cache_manager_.reset();
+            trace_scope_.stop();
+            c10::cuda::CUDACachingAllocator::emptyCache();
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("failed to release warmup resources: %s", e.what());
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("failed to release warmup resources with an unknown error");
+        }
+    }
+
+    WarmUpResourceScope(const WarmUpResourceScope&)            = delete;
+    WarmUpResourceScope& operator=(const WarmUpResourceScope&) = delete;
+
+private:
+    std::unique_ptr<Executor>&             executor_;
+    std::shared_ptr<KVCacheManager>&       cache_manager_;
+    MemoryTraceScope                       trace_scope_;
+    bool                                   started_ = false;
+    bool                                   cleaned_ = false;
+};
+#endif
 }  // anonymous namespace
 
 NormalEngine::NormalEngine(const EngineInitParams&                       params,
@@ -337,14 +424,15 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
     auto fake_input                                   = makeFakeInput(getWarmUpInputLength());
     fake_input->generate_config->num_return_sequences = runtime_config.fifo_scheduler_config.max_context_batch_size;
     fake_input->generate_config->calculate_loss       = int(runtime_config.warm_up_with_loss);
-    rtp_llm::setTraceMemory(true);
+    size_t                          max_consumed = 0;
+    std::shared_ptr<KVCacheManager> warm_up_cache_manager;
+    WarmUpResourceScope             resources(executor_, warm_up_cache_manager);
+    resources.startTrace();
     executor_.reset(new NormalExecutor(params, nullptr, true, false, 0, mla_ops_type_));
     THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::prefill_warm_up));
-    const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
-    rtp_llm::setTraceMemory(false);
-    (void)executor_.reset(nullptr);
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    cudaSyncAndCheck();
+    max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
+    resources.cleanup();
     const auto device_status = getGpuExecStatus();
     return WarmUpResult({device_status.device_memory_status.available_bytes, max_consumed});
 #endif
@@ -358,7 +446,10 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     auto fake_input                                   = makeFakeInput(getWarmUpInputLength());
     fake_input->generate_config->num_return_sequences = runtime_config.max_generate_batch_size;
     fake_input->generate_config->calculate_loss       = int(runtime_config.warm_up_with_loss);
-    rtp_llm::setTraceMemory(true);
+    size_t                          max_consumed = 0;
+    std::shared_ptr<KVCacheManager> warm_up_cache_manager;
+    WarmUpResourceScope             resources(executor_, warm_up_cache_manager);
+    resources.startTrace();
 
     // Do NOT override seq_size_per_block here. createBasicConfig already
     // returns the correct value: model_config.attn_config.tokens_per_block
@@ -380,18 +471,16 @@ WarmUpResult NormalEngine::decodeWarmUp(const EngineInitParams& params) {
     }
     ParallelismConfig temp_parallelism_config;
     RuntimeConfig     temp_runtime_config;
-    auto              cache_manager = make_shared<KVCacheManager>(
+    warm_up_cache_manager = make_shared<KVCacheManager>(
         cache_config, true, nullptr, KVCacheConfig{}, temp_parallelism_config, temp_runtime_config);
-    if (!cache_manager->init()) {
+    if (!warm_up_cache_manager->init()) {
         RTP_LLM_FAIL("init kv cache manager failed in decodeWarmUp");
     }
-    executor_.reset(new NormalExecutor(params, cache_manager, true, false, 0, mla_ops_type_));
+    executor_.reset(new NormalExecutor(params, warm_up_cache_manager, true, false, 0, mla_ops_type_));
     THROW_IF_STATUSOR_ERROR(preRun(fake_input, preRunMode::decode_warm_up));
-    const auto max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
-    rtp_llm::setTraceMemory(false);
-    (void)executor_.reset(nullptr);
-    cudaDeviceSynchronize();
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    cudaSyncAndCheck();
+    max_consumed = getGpuExecStatus().device_memory_status.max_consumed_bytes;
+    resources.cleanup();
     const auto device_status = getGpuExecStatus();
     return WarmUpResult({device_status.device_memory_status.available_bytes, max_consumed});
 #endif
