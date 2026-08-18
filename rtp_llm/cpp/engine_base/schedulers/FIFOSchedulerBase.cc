@@ -6,6 +6,7 @@
 #include <unordered_set>
 
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
+#include "rtp_llm/cpp/engine_base/schedulers/KVCacheSequenceAdmission.h"
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 
@@ -62,28 +63,7 @@ int64_t FIFOSchedulerBase::lastScheduleTime() {
 }
 
 bool FIFOSchedulerBase::checkInputLength(const GenerateStreamPtr& stream) {
-    const auto input_length = static_cast<size_t>(stream->inputLength());
-    const auto reserve_step = stream->reserveStep();
-    if (reserve_step > 0 && !(input_length <= max_seq_len_ && reserve_step <= max_seq_len_ - input_length)) {
-        const auto allowed_input_length = reserve_step <= max_seq_len_ ? max_seq_len_ - reserve_step : 0;
-        auto       error_info           = autil::StringUtil::formatString(
-            "input len %zu with speculative reserve_step %zu exceeds max seq len %zu, "
-            "allowed max input len for speculative decoding is %zu",
-            input_length,
-            reserve_step,
-            max_seq_len_,
-            allowed_input_length);
-        stream->reportError(ErrorCode::LONG_PROMPT_ERROR, error_info);
-        return false;
-    }
-    if (stream->inputLength() > cache_manager_->maxAvailableTokensNum()) {
-        stream->reportError(ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN,
-                            autil::StringUtil::formatString("input len " + std::to_string(stream->inputLength())
-                                                            + " is greater than kv cache max available tokens num "
-                                                            + std::to_string(cache_manager_->maxAvailableTokensNum())));
-        return false;
-    }
-    return true;
+    return admitStreamToKVCache(stream, cache_manager_);
 }
 
 absl::Status FIFOSchedulerBase::enqueue(const GenerateStreamPtr& stream) {

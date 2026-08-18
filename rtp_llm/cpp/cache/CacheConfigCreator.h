@@ -25,6 +25,14 @@ struct KVCacheBlockBudget {
 //   explicit reserve + N * paged bytes + ceil(N / linear_step) * SWA bytes.
 uint32_t maxKVCacheBlockNumForBudget(size_t total_budget_bytes, const KVCacheBlockBudget& budget, int linear_step);
 
+constexpr size_t usableKVCacheBlockNum(size_t configured_block_num) {
+    return configured_block_num > 0 ? configured_block_num - 1 : 0;
+}
+
+constexpr size_t usableKVCacheTokenCapacity(size_t configured_block_num, size_t seq_size_per_block) {
+    return usableKVCacheBlockNum(configured_block_num) * seq_size_per_block;
+}
+
 class CacheConfigCreator {
 public:
     static CacheConfig createBasicConfig(const ModelConfig&       model_config,

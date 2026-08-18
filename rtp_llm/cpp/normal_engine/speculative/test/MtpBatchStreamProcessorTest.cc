@@ -9,6 +9,7 @@
 
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
+#include "rtp_llm/cpp/engine_base/schedulers/KVCacheSequenceAdmission.h"
 
 #define private public
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
@@ -512,6 +513,61 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecUpdatePublishesOnlyCommittedPrefixAt
     ASSERT_TRUE(output.ok());
     ASSERT_EQ(output.value().generate_outputs.size(), 1);
     EXPECT_EQ(toVec<int>(output.value().generate_outputs[0].output_ids), (std::vector<int>{7, 8}));
+    EXPECT_TRUE(output.value().generate_outputs[0].finished);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testSpecUpdateStopsAtPhysicalSequenceLimit) {
+    ModelConfig   model_config;
+    RuntimeConfig runtime_config;
+    auto kv_cache_config = test::makeSimpleMhaCacheConfig(/*layer_num=*/1,
+                                                         /*block_num=*/111,
+                                                         /*tokens_per_block=*/512,
+                                                         rtp_llm::TYPE_INT8,
+                                                         /*local_head_num_kv=*/1,
+                                                         /*size_per_head=*/1);
+    ResourceContext resource_context;
+    resource_context.cache_manager = std::make_shared<KVCacheManager>(kv_cache_config);
+    ASSERT_TRUE(resource_context.cache_manager->init());
+
+    model_config.max_seq_len                  = 202752;
+    model_config.vocab_size                   = 64;
+    model_config.num_layers                   = 1;
+    model_config.attn_config.tokens_per_block = 512;
+
+    auto stream = createContextStream(model_config, runtime_config, resource_context, {1}, 1);
+    stream->generateConfig()->max_new_tokens = 202751;
+    stream->generateConfig()->is_streaming   = true;
+    stream->setReserveStep(4);
+    stream->getSPOutputBuffer()->propose_step = 3;
+
+    const auto limits = sequenceLimitsForAdmission(stream, resource_context.cache_manager);
+    ASSERT_EQ(limits.physical_capacity, 56320);
+    ASSERT_EQ(limits.reserved_token_count, 3);
+    ASSERT_EQ(limits.physical_limit, 56317);
+    ASSERT_EQ(limits.effective_limit, 56317);
+    ASSERT_TRUE(admitStreamToKVCache(stream, resource_context.cache_manager));
+    ASSERT_EQ(stream->generateConfig()->max_new_tokens, 56316);
+
+    stream->setSeqLength(56315);
+    stream->last_output_pos_ = 56315;
+
+    ASSERT_EQ(stream->maxTokenNum(), 56317);
+    stream->specUpdate({torch::tensor({{10, 11, 12, 13}}, torch::kInt32),
+                        4,
+                        /*draft_token=*/14,
+                        torch::Tensor(),
+                        torch::Tensor(),
+                        torch::Tensor()});
+
+    EXPECT_TRUE(stream->statusInfo().ok());
+    EXPECT_EQ(stream->seqLength(), 56317);
+    EXPECT_EQ(stream->getLatestTokens(2), (std::vector<int>{10, 11}));
+    EXPECT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+
+    auto output = stream->nextOutput(1);
+    ASSERT_TRUE(output.ok());
+    ASSERT_EQ(output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(toVec<int>(output.value().generate_outputs[0].output_ids), (std::vector<int>{10, 11}));
     EXPECT_TRUE(output.value().generate_outputs[0].finished);
 }
 

@@ -46,6 +46,13 @@ const std::vector<std::string> kDsv4FlashFirstSeenTags     = {
 const std::vector<std::string> kDsv4ProFirstSeenTags = {
     "hca_kv", "hca_state", "swa_kv", "csa_kv", "indexer_kv", "indexer_state", "csa_state"};
 
+TEST(CacheConfigCapacityTest, UsableCapacityExcludesReservedBlockZero) {
+    EXPECT_EQ(usableKVCacheBlockNum(0), 0);
+    EXPECT_EQ(usableKVCacheBlockNum(1), 0);
+    EXPECT_EQ(usableKVCacheBlockNum(111), 110);
+    EXPECT_EQ(usableKVCacheTokenCapacity(/*configured_block_num=*/111, /*seq_size_per_block=*/512), 56320);
+}
+
 std::shared_ptr<CompressedKVCacheSpec> buildCompressedSpec(const std::string& tag,
                                                            uint32_t           entry_elems,
                                                            uint32_t           entries_per_block,

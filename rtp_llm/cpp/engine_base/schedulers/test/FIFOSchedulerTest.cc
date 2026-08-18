@@ -11,7 +11,9 @@
 #include "autil/TimeUtility.h"
 
 #define protected public
+#include "rtp_llm/cpp/engine_base/schedulers/BatchDecodeScheduler.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
+#include "rtp_llm/cpp/engine_base/schedulers/KVCacheSequenceAdmission.h"
 #include "rtp_llm/cpp/engine_base/schedulers/PDFusionRatioScheduler.h"
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
@@ -37,6 +39,23 @@ class FIFOSchedulerTest: public DeviceTestBase {
 public:
     FIFOSchedulerTest() {}
 };
+
+TEST(KVCacheSequenceAdmissionTest, PhysicalLimitFormulaReservesSpeculativeTail) {
+    const auto limits = calculateKVCacheSequenceLimits(
+        /*physical_capacity=*/56320, /*reserve_step=*/4, /*logical_limit=*/202752);
+    EXPECT_EQ(limits.reserved_token_count, 3);
+    EXPECT_EQ(limits.physical_limit, 56317);
+    EXPECT_EQ(limits.effective_limit, 56317);
+
+    const auto logical_bound =
+        calculateKVCacheSequenceLimits(/*physical_capacity=*/56320, /*reserve_step=*/4, /*logical_limit=*/4096);
+    EXPECT_EQ(logical_bound.effective_limit, 4096);
+
+    const auto non_speculative =
+        calculateKVCacheSequenceLimits(/*physical_capacity=*/56320, /*reserve_step=*/0, /*logical_limit=*/202752);
+    EXPECT_EQ(non_speculative.reserved_token_count, 0);
+    EXPECT_EQ(non_speculative.effective_limit, 56320);
+}
 
 static std::shared_ptr<GenerateConfig> makeTestGenerateConfig(int max_new_tokens = 1) {
     auto generate_config            = make_shared<GenerateConfig>();
@@ -120,7 +139,8 @@ TEST_F(FIFOSchedulerTest, testInitKVCacheLackMem) {
     // checkInputLength rejects the oversized input at enqueue time.
     ASSERT_FALSE(scheduler.enqueue(stream).ok());
     ASSERT_TRUE(stream->hasError());
-    ASSERT_EQ(stream->stopReason(), "input len 3 is greater than kv cache max available tokens num 2");
+    ASSERT_EQ(stream->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    ASSERT_NE(stream->stopReason().find("effective sequence limit 2"), std::string::npos);
     ASSERT_EQ(scheduler.waitingStreamsSize(), 0);
     ASSERT_EQ(scheduler.runningStreamsSize(), 0);
     ASSERT_EQ(cache_manager->freeBlocksNum(), 1);
@@ -205,7 +225,7 @@ TEST_F(FIFOSchedulerTest, testRejectInputWithoutSpeculativeReserveSpace) {
     auto invalid_stream = make_stream(17);
     ASSERT_FALSE(scheduler.enqueue(invalid_stream).ok());
     ASSERT_TRUE(invalid_stream->hasError());
-    ASSERT_EQ(invalid_stream->statusInfo().code(), ErrorCode::LONG_PROMPT_ERROR);
+    ASSERT_EQ(invalid_stream->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
     ASSERT_NE(invalid_stream->stopReason().find("reserve_step 4"), std::string::npos);
     ASSERT_EQ(scheduler.waitingStreamsSize(), 0);
 
@@ -215,7 +235,7 @@ TEST_F(FIFOSchedulerTest, testRejectInputWithoutSpeculativeReserveSpace) {
     ASSERT_EQ(enqueue_successes, std::vector<bool>({false, true}));
     ASSERT_EQ(enqueued_streams, std::vector<GenerateStreamPtr>({invalid_stream2, valid_stream}));
     ASSERT_TRUE(invalid_stream2->hasError());
-    ASSERT_EQ(invalid_stream2->statusInfo().code(), ErrorCode::LONG_PROMPT_ERROR);
+    ASSERT_EQ(invalid_stream2->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
     ASSERT_EQ(scheduler.waitingStreamsSize(), 1);
 }
 
@@ -255,14 +275,13 @@ TEST_F(FIFOSchedulerTest, testRejectSpeculativeTailWithoutReserveSpace) {
     auto invalid_stream = make_stream(509);
     ASSERT_FALSE(scheduler.enqueue(invalid_stream).ok());
     ASSERT_TRUE(invalid_stream->hasError());
-    ASSERT_EQ(invalid_stream->statusInfo().code(), ErrorCode::LONG_PROMPT_ERROR);
+    ASSERT_EQ(invalid_stream->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
     ASSERT_NE(invalid_stream->stopReason().find("reserve_step 4"), std::string::npos);
-    ASSERT_NE(invalid_stream->stopReason().find("allowed max input len for speculative decoding is 508"),
-              std::string::npos);
+    ASSERT_NE(invalid_stream->stopReason().find("effective sequence limit 509"), std::string::npos);
     ASSERT_EQ(scheduler.waitingStreamsSize(), 1);
 }
 
-TEST_F(FIFOSchedulerTest, testIncrKVCacheLackMem) {
+TEST_F(FIFOSchedulerTest, testRejectPromptAtPhysicalKVLimit) {
     CacheConfig                     cache_config  = makeMhaCacheConfig(1, 3, 1, 4, 2, rtp_llm::DataType::TYPE_FP16);
     std::shared_ptr<KVCacheManager> cache_manager = std::make_shared<KVCacheManager>(cache_config);
     ASSERT_TRUE(cache_manager->init());
@@ -281,27 +300,228 @@ TEST_F(FIFOSchedulerTest, testIncrKVCacheLackMem) {
         runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
     std::shared_ptr<GenerateInput> query = make_shared<GenerateInput>();
     query->input_ids                     = torch::tensor({1, 2, 3, 4}, torch::kInt32);
-    query->generate_config               = makeTestGenerateConfig(0);
+    query->generate_config               = makeTestGenerateConfig(1);
     shared_ptr<GenerateStream> stream =
         make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
-    ASSERT_TRUE(scheduler.enqueue(stream).ok());
-
-    // Single schedule: stream calls initKVBlock and asyncLoadCache (returns false)
-    // Since no cache loading is needed, stream transitions directly to RUNNING in one schedule call
-    auto streams_status = scheduler.schedule();
-    ASSERT_TRUE(streams_status.ok());
-    ASSERT_EQ(streams_status.value().size(), 1);
-    ASSERT_FALSE(stream->hasError());
-    ASSERT_EQ(stream->stopReason(), "");
-    ASSERT_EQ(cache_manager->freeBlocksNum(), 0);
-
-    stream->setSeqLength(stream->seqLength() + 1);
-    auto streams_status2 = scheduler.schedule();
-    ASSERT_TRUE(streams_status2.ok());
-    ASSERT_EQ(streams_status2.value().size(), 0);
+    ASSERT_FALSE(scheduler.enqueue(stream).ok());
     ASSERT_TRUE(stream->hasError());
-    ASSERT_EQ(stream->stopReason(), "incrKVBlock failed: LACK MEM");
+    ASSERT_EQ(stream->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    ASSERT_NE(stream->stopReason().find("effective sequence limit 4"), std::string::npos);
     ASSERT_EQ(cache_manager->freeBlocksNum(), 2);
+}
+
+TEST_F(FIFOSchedulerTest, testFIFOAndBatchDecodeSharePhysicalSequenceAdmission) {
+    constexpr int kTokensPerBlock = 2;
+    CacheConfig   cache_config =
+        makeMhaCacheConfig(1, 5, 1, 4, kTokensPerBlock, rtp_llm::DataType::TYPE_FP16);
+    auto cache_manager = std::make_shared<KVCacheManager>(cache_config);
+    ASSERT_TRUE(cache_manager->init());
+    ASSERT_EQ(cache_manager->maxAvailableTokensNum(), 8);
+
+    ResourceContext resource_context;
+    resource_context.cache_manager = cache_manager;
+    ModelConfig model_config;
+    model_config.max_seq_len                  = 100;
+    model_config.attn_config.tokens_per_block = kTokensPerBlock;
+    RuntimeConfig runtime_config;
+    runtime_config.max_generate_batch_size                     = 16;
+    runtime_config.fifo_scheduler_config.max_batch_tokens_size = 100;
+    runtime_config.batch_decode_scheduler_config.batch_decode_scheduler_batch_size = 1;
+    PDSepConfig         pd_sep_config;
+    ParallelismConfig   parallelism_config;
+    ModelSpecificConfig model_specific_config;
+    FIFOScheduler fifo(
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
+    BatchDecodeScheduler batch(runtime_config, cache_manager, nullptr);
+
+    auto make_stream = [&](int input_length, int max_new_tokens, int min_new_tokens, size_t reserve_step) {
+        auto query                     = std::make_shared<GenerateInput>();
+        query->input_ids = torch::ones({static_cast<int64_t>(input_length)}, torch::kInt32);
+        query->generate_config         = makeTestGenerateConfig(max_new_tokens);
+        query->generate_config->min_new_tokens = min_new_tokens;
+        auto stream =
+            std::make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
+        stream->setReserveStep(reserve_step);
+        return stream;
+    };
+
+    auto fifo_clamped  = make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/0, 4);
+    auto batch_clamped = make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/0, 4);
+    EXPECT_TRUE(fifo.enqueue(fifo_clamped).ok());
+    EXPECT_TRUE(batch.enqueue(batch_clamped).ok());
+    EXPECT_EQ(fifo_clamped->generateConfig()->max_new_tokens, 2);
+    EXPECT_EQ(batch_clamped->generateConfig()->max_new_tokens, 2);
+    EXPECT_EQ(fifo_clamped->maxTokenNum(), 5);
+    EXPECT_EQ(batch_clamped->maxTokenNum(), 5);
+
+    auto fifo_prompt_boundary  = make_stream(/*input_length=*/5, /*max_new_tokens=*/1, /*min_new_tokens=*/0, 4);
+    auto batch_prompt_boundary = make_stream(/*input_length=*/5, /*max_new_tokens=*/1, /*min_new_tokens=*/0, 4);
+    EXPECT_FALSE(fifo.enqueue(fifo_prompt_boundary).ok());
+    EXPECT_FALSE(batch.enqueue(batch_prompt_boundary).ok());
+    EXPECT_EQ(fifo_prompt_boundary->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    EXPECT_EQ(batch_prompt_boundary->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+
+    auto fifo_minimum  = make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/3, 4);
+    auto batch_minimum = make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/3, 4);
+    EXPECT_FALSE(fifo.enqueue(fifo_minimum).ok());
+    EXPECT_FALSE(batch.enqueue(batch_minimum).ok());
+    EXPECT_EQ(fifo_minimum->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    EXPECT_EQ(batch_minimum->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+
+    auto fifo_last_token  = make_stream(/*input_length=*/4, /*max_new_tokens=*/100, /*min_new_tokens=*/1, 4);
+    auto batch_last_token = make_stream(/*input_length=*/4, /*max_new_tokens=*/100, /*min_new_tokens=*/1, 4);
+    EXPECT_TRUE(fifo.enqueue(fifo_last_token).ok());
+    EXPECT_TRUE(batch.enqueue(batch_last_token).ok());
+    EXPECT_EQ(fifo_last_token->generateConfig()->max_new_tokens, 1);
+    EXPECT_EQ(batch_last_token->generateConfig()->max_new_tokens, 1);
+
+    auto fifo_two_required  = make_stream(/*input_length=*/4, /*max_new_tokens=*/100, /*min_new_tokens=*/2, 4);
+    auto batch_two_required = make_stream(/*input_length=*/4, /*max_new_tokens=*/100, /*min_new_tokens=*/2, 4);
+    EXPECT_FALSE(fifo.enqueue(fifo_two_required).ok());
+    EXPECT_FALSE(batch.enqueue(batch_two_required).ok());
+    EXPECT_EQ(fifo_two_required->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    EXPECT_EQ(batch_two_required->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+
+    auto non_speculative = make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/0, 0);
+    non_speculative->generateConfig()->force_disable_sp_run = true;
+    EXPECT_TRUE(admitStreamToKVCache(non_speculative, cache_manager));
+    EXPECT_EQ(non_speculative->generateConfig()->max_new_tokens, 5);
+
+    auto oversized_request =
+        make_stream(/*input_length=*/3, std::numeric_limits<int>::max(), /*min_new_tokens=*/0, 4);
+    EXPECT_TRUE(admitStreamToKVCache(oversized_request, cache_manager));
+    EXPECT_EQ(oversized_request->generateConfig()->max_new_tokens, 2);
+
+    auto invalid_request = make_stream(/*input_length=*/3, /*max_new_tokens=*/0, /*min_new_tokens=*/0, 4);
+    EXPECT_FALSE(admitStreamToKVCache(invalid_request, cache_manager));
+    EXPECT_EQ(invalid_request->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+
+    auto fifo_inconsistent  = make_stream(/*input_length=*/3, /*max_new_tokens=*/2, /*min_new_tokens=*/3, 0);
+    auto batch_inconsistent = make_stream(/*input_length=*/3, /*max_new_tokens=*/2, /*min_new_tokens=*/3, 0);
+    EXPECT_FALSE(fifo.enqueue(fifo_inconsistent).ok());
+    EXPECT_FALSE(batch.enqueue(batch_inconsistent).ok());
+    EXPECT_EQ(fifo_inconsistent->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(batch_inconsistent->statusInfo().code(), ErrorCode::INVALID_PARAMS);
+
+    auto request_flag_does_not_bypass_active_executor =
+        make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/0, 4);
+    request_flag_does_not_bypass_active_executor->generateConfig()->force_disable_sp_run = true;
+    EXPECT_TRUE(admitStreamToKVCache(request_flag_does_not_bypass_active_executor, cache_manager));
+    EXPECT_EQ(request_flag_does_not_bypass_active_executor->generateConfig()->max_new_tokens, 2);
+
+    auto beam_does_not_bypass_active_executor =
+        make_stream(/*input_length=*/3, /*max_new_tokens=*/100, /*min_new_tokens=*/0, 4);
+    beam_does_not_bypass_active_executor->generateConfig()->num_beams = 2;
+    EXPECT_TRUE(admitStreamToKVCache(beam_does_not_bypass_active_executor, cache_manager));
+    EXPECT_EQ(beam_does_not_bypass_active_executor->generateConfig()->max_new_tokens, 2);
+}
+
+TEST_F(FIFOSchedulerTest, testAdmissionReservesSpeculativeWindowBeforeBufferExists) {
+    // The cache is deliberately large so the physical limit cannot be what rejects: this isolates
+    // the logical side, where maxTokenNum() cannot see the executor window yet because the
+    // speculative output buffer is attached only after admission.
+    constexpr int kTokensPerBlock = 8;
+    CacheConfig   cache_config =
+        makeMhaCacheConfig(1, 32, 1, 4, kTokensPerBlock, rtp_llm::DataType::TYPE_FP16);
+    auto cache_manager = std::make_shared<KVCacheManager>(cache_config);
+    ASSERT_TRUE(cache_manager->init());
+    ASSERT_EQ(cache_manager->maxAvailableTokensNum(), 248);
+
+    ResourceContext resource_context;
+    resource_context.cache_manager = cache_manager;
+    ModelConfig model_config;
+    model_config.max_seq_len                  = 20;
+    model_config.attn_config.tokens_per_block = kTokensPerBlock;
+    RuntimeConfig runtime_config;
+
+    auto make_stream = [&](int input_length, size_t reserve_step) {
+        auto query             = std::make_shared<GenerateInput>();
+        query->input_ids       = torch::ones({static_cast<int64_t>(input_length)}, torch::kInt32);
+        query->generate_config = makeTestGenerateConfig(/*max_new_tokens=*/100);
+        auto stream =
+            std::make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
+        stream->setReserveStep(reserve_step);
+        return stream;
+    };
+
+    auto at_boundary = make_stream(/*input_length=*/17, /*reserve_step=*/4);
+    ASSERT_EQ(at_boundary->getSPOutputBuffer(), nullptr);
+    ASSERT_EQ(at_boundary->maxTokenNum(), 20);
+    EXPECT_FALSE(admitStreamToKVCache(at_boundary, cache_manager));
+    EXPECT_EQ(at_boundary->statusInfo().code(), ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN);
+    EXPECT_NE(at_boundary->stopReason().find("logical limit 17"), std::string::npos);
+
+    auto below_boundary = make_stream(/*input_length=*/16, /*reserve_step=*/4);
+    EXPECT_TRUE(admitStreamToKVCache(below_boundary, cache_manager));
+    EXPECT_EQ(below_boundary->generateConfig()->max_new_tokens, 1);
+
+    auto without_speculation = make_stream(/*input_length=*/17, /*reserve_step=*/0);
+    EXPECT_TRUE(admitStreamToKVCache(without_speculation, cache_manager));
+    EXPECT_EQ(without_speculation->generateConfig()->max_new_tokens, 3);
+}
+
+TEST_F(FIFOSchedulerTest, testPhysicalLimitTerminalExitsBeforeNextKVAllocation) {
+    constexpr int kTokensPerBlock = 2;
+    CacheConfig   cache_config =
+        makeMhaCacheConfig(1, 5, 1, 4, kTokensPerBlock, rtp_llm::DataType::TYPE_FP16);
+    auto cache_manager = std::make_shared<KVCacheManager>(cache_config);
+    ASSERT_TRUE(cache_manager->init());
+    ASSERT_EQ(cache_manager->maxAvailableTokensNum(), 8);
+
+    ResourceContext resource_context;
+    resource_context.cache_manager = cache_manager;
+    ModelConfig model_config;
+    model_config.max_seq_len                  = 100;
+    model_config.vocab_size                   = 64;
+    model_config.attn_config.tokens_per_block = kTokensPerBlock;
+    RuntimeConfig runtime_config;
+    runtime_config.max_generate_batch_size                     = 1;
+    runtime_config.fifo_scheduler_config.max_batch_tokens_size = 100;
+    PDSepConfig         pd_sep_config;
+    ParallelismConfig   parallelism_config;
+    ModelSpecificConfig model_specific_config;
+    FIFOScheduler scheduler(
+        runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
+
+    auto query                            = std::make_shared<GenerateInput>();
+    query->input_ids                      = torch::tensor({1}, torch::kInt32);
+    query->generate_config                = makeTestGenerateConfig(/*max_new_tokens=*/100);
+    query->generate_config->is_streaming = true;
+    auto stream =
+        std::make_shared<NormalGenerateStream>(query, model_config, runtime_config, resource_context, nullptr);
+    stream->setReserveStep(4);
+    auto sp_output_buffer          = std::make_shared<SpeculativeExecutorStreamOutput>();
+    sp_output_buffer->propose_step = 3;
+    sp_output_buffer->tokens       = torch::zeros({1, 2}, torch::kInt32);
+    stream->setSPOutputBuffer(sp_output_buffer);
+
+    ASSERT_TRUE(scheduler.enqueue(stream).ok());
+    ASSERT_EQ(stream->generateConfig()->max_new_tokens, 4);
+    ASSERT_EQ(stream->maxTokenNum(), 5);
+
+    auto first_round = scheduler.schedule();
+    ASSERT_TRUE(first_round.ok());
+    ASSERT_EQ(first_round.value().size(), 1);
+    ASSERT_EQ(first_round.value().front().get(), stream.get());
+    ASSERT_FALSE(stream->hasError());
+
+    stream->specUpdate({torch::tensor({{10, 11, 12, 13}}, torch::kInt32),
+                        4,
+                        /*draft_token=*/14,
+                        torch::Tensor(),
+                        torch::Tensor(),
+                        torch::Tensor()});
+    ASSERT_EQ(stream->seqLength(), 5);
+    ASSERT_TRUE(stream->hasEvent(StreamEvents::GenerateDone));
+
+    // totalSeqLength() is now 5 + reserve_step(4) = 9 tokens. A spurious
+    // incrKVBlock() would require 5 blocks although only 4 usable blocks exist.
+    auto terminal_round = scheduler.schedule();
+    ASSERT_TRUE(terminal_round.ok());
+    EXPECT_TRUE(terminal_round.value().empty());
+    EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    EXPECT_FALSE(stream->hasError());
+    EXPECT_EQ(cache_manager->freeBlocksNum(), 4);
 }
 
 TEST_F(FIFOSchedulerTest, testInitKVCacheRejectedByReserveBlocks) {
@@ -1214,7 +1434,7 @@ TEST_F(FIFOSchedulerTest, testMultiSequenceAdmissionMatchesPhysicalFreeBlockWate
                                 model_config,
                                 runtime_config,
                                 resource_context,
-                                /*max_new_tokens=*/0);
+                                /*max_new_tokens=*/1);
     ASSERT_TRUE(scheduler.enqueue(in_flight).ok());
     auto first_prefill = scheduler.schedule();
     ASSERT_TRUE(first_prefill.ok());
@@ -1633,7 +1853,7 @@ TEST_F(FIFOSchedulerTest, testSinglePrefillDefersReserveCapacityFailureToAllocat
                              model_config,
                              runtime_config,
                              resource_context,
-                             /*max_new_tokens=*/0);
+                             /*max_new_tokens=*/1);
     ASSERT_TRUE(scheduler.enqueue(stream).ok());
     ASSERT_FALSE(stream->hasError());
     ASSERT_EQ(scheduler.waitingStreamsSize(), 1);
@@ -1672,7 +1892,7 @@ TEST_F(FIFOSchedulerTest, testPrefillAdmissionUsesMaxTokenNumRemainingTokens) {
     PDFusionRatioScheduler scheduler(
         runtime_config, model_config, pd_sep_config, parallelism_config, model_specific_config, cache_manager);
 
-    auto seed = makeStream({0}, model_config, runtime_config, resource_context, /*max_new_tokens=*/0);
+    auto seed = makeStream({0}, model_config, runtime_config, resource_context, /*max_new_tokens=*/1);
     ASSERT_TRUE(scheduler.enqueue(seed).ok());
     auto seed_prefill = scheduler.schedule();
     ASSERT_TRUE(seed_prefill.ok());

@@ -62,6 +62,10 @@ TEST(SpeculativeSequenceLimitTest, CommitsOnePrefixForEveryRemainingBoundary) {
     EXPECT_EQ(committedSpeculativeTokenCount(/*current_seq_len=*/6, /*effective_max_tokens=*/7, 3), 1);
     EXPECT_EQ(committedSpeculativeTokenCount(/*current_seq_len=*/5, /*effective_max_tokens=*/7, 3), 2);
     EXPECT_EQ(committedSpeculativeTokenCount(/*current_seq_len=*/4, /*effective_max_tokens=*/7, 3), 3);
+    // A long-context boundary: only 2 of the 4 emitted tokens fit under the limit.
+    EXPECT_EQ(committedSpeculativeTokenCount(
+                  /*current_seq_len=*/56315, /*effective_max_tokens=*/56317, /*emitted_tokens=*/4),
+              2);
 }
 
 }  // namespace rtp_llm

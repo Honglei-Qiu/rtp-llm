@@ -10,11 +10,25 @@
 
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/model_rpc/LocalRpcServer.h"
+#include "rtp_llm/cpp/model_rpc/RpcErrorCode.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 
 using namespace ::testing;
 
 namespace rtp_llm {
+
+TEST(RpcErrorCodeTest, DistinguishesPermanentCapacityFromTransientAllocationFailure) {
+    EXPECT_EQ(transErrorCodeToGrpc(ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN), grpc::StatusCode::OUT_OF_RANGE);
+    EXPECT_EQ(transErrorCodeToGrpc(ErrorCode::MALLOC_FAILED), grpc::StatusCode::RESOURCE_EXHAUSTED);
+}
+
+TEST(RpcErrorCodeTest, MalformedRequestIsNotReportedAsServerFault) {
+    // Unmapped codes fall through to INTERNAL, which a client reads as a server
+    // fault and retries; a malformed request can never succeed on retry.
+    EXPECT_EQ(transErrorCodeToGrpc(ErrorCode::INVALID_PARAMS), grpc::StatusCode::INVALID_ARGUMENT);
+    EXPECT_NE(transErrorCodeToGrpc(ErrorCode::INVALID_PARAMS),
+              transErrorCodeToGrpc(ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN));
+}
 
 class MockGenerateStream: public GenerateStream {
 public:

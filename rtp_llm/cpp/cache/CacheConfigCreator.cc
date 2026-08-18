@@ -227,21 +227,28 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
 
     uint32_t block_num = computeBlockNum(
         config, model_config, runtime_config, kv_cache_config, parallelism_config, warm_up_result, sp_config);
-    RTP_LLM_CHECK_WITH_INFO(block_num > 0,
-                            "kv cache needs at least 1 block but %ld, each block needs %ld MiB memory",
+    const auto usable_block_num = usableKVCacheBlockNum(block_num);
+    RTP_LLM_CHECK_WITH_INFO(usable_block_num > 0,
+                            "kv cache needs at least 1 usable block after reserving block0 but configured %u, each "
+                            "block needs %ld MiB memory",
                             block_num,
                             static_cast<long>(config.block_size_bytes / 1024 / 1024));
 
-    const auto kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
+    const auto kv_cache_seq_len = usableKVCacheTokenCapacity(block_num, config.seq_size_per_block);
     config.block_num            = static_cast<int>(block_num);
     config.finalizeBlockNums(block_num, runtime_config);
-    RTP_LLM_LOG_INFO("kv cache block nums is %u, allows storing %ld tokens", block_num, kv_cache_seq_len);
+    RTP_LLM_LOG_INFO("kv cache configured block nums is %u, usable block nums after reserving block0 is %zu, "
+                     "allows storing %zu tokens",
+                     block_num,
+                     usable_block_num,
+                     kv_cache_seq_len);
     if (kv_cache_seq_len < model_config.max_seq_len) {
-        RTP_LLM_LOG_WARNING("kv cache block nums %u can only store %ld tokens, less than max_seq_len %ld, "
-                            "this is dangerous, consider decrease max_seq_len",
+        RTP_LLM_LOG_WARNING("kv cache configured block nums %u has %zu usable blocks and can only store %zu tokens, "
+                            "less than max_seq_len %ld; requests will be capped at runtime",
                             block_num,
+                            usable_block_num,
                             kv_cache_seq_len,
-                            model_config.max_seq_len);
+                            static_cast<long>(model_config.max_seq_len));
     }
     return config;
 }
@@ -327,7 +334,11 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
         block_num = maxKVCacheBlockNumForBudget(kv_cache_mem_size, joint_budget, joint_step);
     }
 
-    RTP_LLM_CHECK_WITH_INFO(block_num > 0, "kv cache needs at least 1 block but %zu", block_num);
+    const auto usable_block_num = usableKVCacheBlockNum(block_num);
+    RTP_LLM_CHECK_WITH_INFO(
+        usable_block_num > 0,
+        "sp kv cache needs at least 1 usable block after reserving block0 but configured %zu",
+        block_num);
 
     CacheConfig config                         = score_config;
     config.linear_step                         = joint_step;
@@ -365,18 +376,29 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
     config.finalizeBlockNums(static_cast<uint32_t>(block_num), runtime_config);
     config.explicitly_sized_pool_reserve_bytes = explicit_pool_reserve;
 
-    const auto kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
-    RTP_LLM_LOG_INFO("CacheConfig created: is_mtp=%d, total_layers=%u, num_mtp_modules=%d, block_num=%zu, "
-                     "allows storing %zu tokens, total_block_size=%zu bytes (main=%zu + %d*propose=%zu)",
+    const auto kv_cache_seq_len = usableKVCacheTokenCapacity(block_num, config.seq_size_per_block);
+    RTP_LLM_LOG_INFO("CacheConfig created: is_mtp=%d, total_layers=%u, num_mtp_modules=%d, configured_block_num=%zu, "
+                     "usable_block_num_after_reserving_block0=%zu, allows storing %zu tokens, "
+                     "total_block_size=%zu bytes "
+                     "(main=%zu + %d*propose=%zu)",
                      is_mtp,
                      total_layer_num,
                      num_mtp_modules,
                      block_num,
+                     usable_block_num,
                      kv_cache_seq_len,
                      total_block_size_bytes,
                      score_config.block_size_bytes,
                      num_mtp_modules,
                      propose_config.block_size_bytes);
+    if (kv_cache_seq_len < score_model_config.max_seq_len) {
+        RTP_LLM_LOG_WARNING("sp kv cache configured block nums %zu has %zu usable blocks and can only store %zu "
+                            "tokens, less than max_seq_len %ld; requests will be capped at runtime",
+                            block_num,
+                            usable_block_num,
+                            kv_cache_seq_len,
+                            static_cast<long>(score_model_config.max_seq_len));
+    }
 
     RTP_LLM_LOG_INFO("CacheConfig debugString(main_score_model):\n%s", score_config.debugString().c_str());
     for (size_t i = 0; i < config.mtp_sub_configs.size(); ++i) {

@@ -1,9 +1,10 @@
 #pragma once
 
 #include "autil/legacy/jsonizable.h"
-#include "rtp_llm/cpp/engine_base/schedulers/SchedulerBase.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/cache/Types.h"
+#include "rtp_llm/cpp/engine_base/schedulers/KVCacheSequenceAdmission.h"
+#include "rtp_llm/cpp/engine_base/schedulers/SchedulerBase.h"
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
@@ -37,17 +38,8 @@ public:
     }
     virtual ~BatchDecodeScheduler() = default;
 
-    // Reject inputs longer than the KV cache can hold; mark the stream errored so the caller
-    // sees the failure via collectStreamOutput / pollStreamOutput. Mirrors FIFOScheduler.
     bool checkInputLength(const GenerateStreamPtr& stream) {
-        if (cache_manager_ && stream->inputLength() > cache_manager_->maxAvailableTokensNum()) {
-            stream->reportError(ErrorCode::EXCEEDS_KV_CACHE_MAX_LEN,
-                                "input len " + std::to_string(stream->inputLength())
-                                    + " is greater than kv cache max available tokens num "
-                                    + std::to_string(cache_manager_->maxAvailableTokensNum()));
-            return false;
-        }
-        return true;
+        return admitStreamToKVCache(stream, cache_manager_);
     }
 
     absl::Status enqueue(const GenerateStreamPtr& stream) override {
