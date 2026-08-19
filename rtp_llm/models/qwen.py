@@ -25,6 +25,7 @@ from rtp_llm.utils.model_weight import (
     transpose_pad,
     zeros,
 )
+from rtp_llm.utils.util import get_config_dtype
 
 
 def hidden_to_inter(hidden_size):
@@ -294,6 +295,8 @@ class QWenBase(BaseModel):
             config.attn_config.rope_config.style = 4
         config.attn_config.rope_config.max_pos = config_json.get("seq_length", 8192)
         config.attn_config.use_logn_attn = config_json.get("use_logn_attn")
+        # This family parsed config.json without ever reading the declared dtype.
+        config.config_dtype = get_config_dtype(config_json)
 
 
 class QWen(QWenBase):

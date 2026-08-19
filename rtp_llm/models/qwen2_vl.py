@@ -30,6 +30,7 @@ from rtp_llm.utils.model_weight import (
     transpose_pad,
     zeros,
 )
+from rtp_llm.utils.util import get_config_dtype
 
 
 class QWen2VLWeightInfo(ModelDeployWeightInfo):
@@ -250,6 +251,8 @@ class QWen2_VL(QWen_VL):
         config.special_tokens.bos_token_id = config_json.get("bos_token_id", -1)
         config.special_tokens.eos_token_id = config_json.get("eos_token_id", 0)
         config.tie_word_embeddings = config_json.get("tie_word_embeddings", False)
+        # This family parsed config.json without ever reading the declared dtype.
+        config.config_dtype = get_config_dtype(config_json)
         config.mm_model_config.mm_position_ids_style = 2
         rope_config = config.attn_config.rope_config
         rope_config.style = 7

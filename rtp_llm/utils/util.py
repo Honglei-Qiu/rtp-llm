@@ -109,6 +109,29 @@ def get_config_from_path(ckpt_path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def get_config_dtype(config_dict: Optional[Dict[str, Any]]) -> Optional[str]:
+    # transformers renamed this field from `torch_dtype` to `dtype`, so a checkpoint
+    # written by a recent release carries only `dtype`. Reading a single name loses the
+    # declared precision for half the checkpoints in the wild, and nothing downstream
+    # can tell "not declared" from "declared but read under the other name" — data_type
+    # then falls back to FP16 with only an INFO log. `dtype` wins when both are present,
+    # matching transformers 4.57 PretrainedConfig.__init__.
+    if not config_dict:
+        return None
+
+    def declared(key: str) -> Optional[str]:
+        # transformers also accepts non-string dtype values (per-module dicts), and a
+        # blank string is not a declaration. Both must read as "not declared": passing
+        # them on reaches WEIGHT_TYPE.from_str, where a dict raises AttributeError and a
+        # blank string silently selects the FP16 default over the other key's real value.
+        value = config_dict.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        return None
+
+    return declared("dtype") or declared("torch_dtype")
+
+
 def generate_pad_mask(
     input_lengths: torch.Tensor, memory_length: int, init_step: int = 0
 ):

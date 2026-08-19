@@ -69,6 +69,19 @@ py_test(
 )
 
 py_test(
+    name = "config_dtype_key_test",
+    srcs = [
+        "config_dtype_key_test.py",
+    ],
+    data = [],
+    deps = [
+        "//rtp_llm:testlib",
+    ],
+    imports = [],
+    exec_properties = {'gpu':'H20'},
+)
+
+py_test(
     name = "reasoning_tool_parsing_test",
     srcs = [
         "reasoning_tool_parsing_test.py",

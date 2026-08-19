@@ -39,6 +39,7 @@ from rtp_llm.utils.model_weight import (
     transpose,
     transpose_pad,
 )
+from rtp_llm.utils.util import get_config_dtype
 
 
 class Glm4MoeWeight(ModelDeployWeightInfo):
@@ -440,6 +441,8 @@ class Glm4Moe(DeepSeekV2):
     @staticmethod
     def _from_config_json(config: "ModelConfig", config_json: Dict[str, Any]):
         config.inter_size = config_json["intermediate_size"]
+        # This family parsed config.json without ever reading the declared dtype.
+        config.config_dtype = get_config_dtype(config_json)
         config.attn_config.head_num = config_json["num_attention_heads"]
         config.attn_config.kv_head_num = config_json.get(
             "num_key_value_heads", config.attn_config.head_num
